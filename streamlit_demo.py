@@ -163,7 +163,7 @@ def fill_merged_cells(ws):
 
 
 
-def llm_detect_header_row(df, max_rows_to_analyze=10):
+def llm_detect_header_row(df, max_rows_to_analyze=15):
     """
     Use LLM to intelligently detect header row with fallback to rule-based detection.
     
@@ -172,11 +172,16 @@ def llm_detect_header_row(df, max_rows_to_analyze=10):
     
     Args:
         df: DataFrame to analyze
-        max_rows_to_analyze: Number of rows to send to LLM (default 10)
+        max_rows_to_analyze: Number of rows to send to LLM (default 15)
     
     Returns:
         int: Header row index (0-based) or -1 if no header found
     """
+    # Check if DataFrame is empty
+    if df.empty or len(df.columns) == 0:
+        logger.warning("DataFrame is empty, cannot detect header")
+        return -1
+    
     try:
         client = get_anthropic_client()
         if not client:
@@ -186,42 +191,77 @@ def llm_detect_header_row(df, max_rows_to_analyze=10):
         # Limit analysis to prevent overwhelming LLM
         sample_df = df.head(max_rows_to_analyze)
         
-        # Convert to a format suitable for LLM analysis
+        # Convert to a format suitable for LLM analysis with better data representation
         sample_data = []
-        for i, row in sample_df.iterrows():
-            row_data = {}
-            for j, val in enumerate(row):
-                row_data[f"col_{j}"] = str(val) if pd.notna(val) else "NULL"
-            sample_data.append({"row_index": i, "data": row_data})
+        for i in range(len(sample_df)):
+            row_data = []
+            for j in range(len(sample_df.columns)):
+                val = sample_df.iloc[i, j]
+                # Better value representation
+                if pd.isna(val):
+                    row_data.append("EMPTY")
+                elif isinstance(val, (int, float)):
+                    row_data.append(f"NUM:{val}")
+                elif isinstance(val, str):
+                    row_data.append(f"TEXT:{val[:50]}")  # Limit string length
+                else:
+                    row_data.append(f"OTHER:{str(val)[:30]}")
+            sample_data.append({"row": i, "values": row_data})
         
-        prompt = f"""Analyze this Excel data sample and identify the header row index.
+        # Also collect column statistics for better analysis
+        col_stats = []
+        for j in range(min(len(df.columns), 20)):  # Analyze first 20 columns
+            col = df.iloc[:, j].dropna()
+            if len(col) > 0:
+                text_count = sum(1 for v in col if isinstance(v, str) and not str(v).replace('.','').replace('-','').isdigit())
+                num_count = sum(1 for v in col if isinstance(v, (int, float)) or (isinstance(v, str) and str(v).replace('.','').replace('-','').isdigit()))
+                col_stats.append({
+                    "col_index": j,
+                    "text_ratio": text_count / len(col),
+                    "num_ratio": num_count / len(col),
+                    "unique_count": col.nunique()
+                })
+        
+        prompt = f"""Analyze this Excel data and identify the header row.
 
-Data sample (first {len(sample_data)} rows):
-{json.dumps(sample_data, indent=2)}
+DATA SAMPLE (first {len(sample_data)} rows):
+{json.dumps(sample_data, indent=2, default=str)}
 
-Rules for header detection:
-1. Headers typically contain descriptive text (not numbers or dates)
-2. Headers often have keywords like: name, id, date, amount, total, code, address, phone, email, status, type
-3. Data rows below headers should be consistent in type
-4. Headers should not be purely numeric values
-5. Headers are usually in the first few rows (0-5)
+COLUMN STATISTICS:
+{json.dumps(col_stats[:10], indent=2, default=str)}
 
-Return ONLY a JSON object with this exact structure:
+HEADER DETECTION RULES:
+1. Headers contain descriptive labels (TEXT values), not data
+2. Common header keywords: name, id, date, amount, total, price, quantity, code, number, description, status, type, category, address, phone, email, customer, product, order
+3. Headers usually appear before actual data rows
+4. If first row has mostly TEXT values and subsequent rows have mixed/numeric data, first row is likely header
+5. Empty rows before header are common (header may not be at row 0)
+6. Headers should span most columns (not just a few cells)
+7. If no clear headers exist, return -1
+
+IMPORTANT: Look for the row that transitions from labels/headers to actual data values.
+
+Return ONLY this JSON:
 {{
-    "header_row_index": 0,
-    "confidence": 0.95,
-    "reasoning": "Row 0 contains descriptive column names like 'Customer_Name', 'Order_Date'"
-}}
-
-If no clear header is found, return header_row_index: -1"""
+    "header_row_index": <number or -1>,
+    "confidence": <0.0 to 1.0>,
+    "reasoning": "<brief explanation>"
+}}"""
 
         response = client.messages.create(
             model="claude-3-5-sonnet-20241022",
             max_tokens=300,
+            temperature=0.2,  # Lower temperature for more consistent results
             messages=[{"role": "user", "content": prompt}]
         )
         
         response_text = response.content[0].text.strip()
+        
+        # Extract JSON even if wrapped in text
+        import re
+        json_match = re.search(r'\{[^}]*"header_row_index"[^}]*\}', response_text, re.DOTALL)
+        if json_match:
+            response_text = json_match.group(0)
         
         # Parse JSON response
         try:
@@ -233,19 +273,20 @@ If no clear header is found, return header_row_index: -1"""
             logger.info(f"LLM header detection: row {header_idx}, confidence {confidence}")
             logger.info(f"LLM reasoning: {reasoning}")
             
-            # Validate the result
-            if header_idx >= 0 and header_idx < len(df) and confidence > 0.5:
-                return header_idx
-            else:
-                logger.info("LLM confidence too low, falling back to rule-based detection")
-                return detect_header_row_smart(df)
+            # Validate the result more thoroughly
+            if isinstance(header_idx, int) and header_idx >= -1 and header_idx < len(df):
+                if header_idx == -1 or confidence > 0.4:  # Lower threshold for acceptance
+                    return header_idx
+            
+            logger.info("LLM result invalid or low confidence, falling back to rule-based detection")
+            return detect_header_row_smart(df)
                 
-        except json.JSONDecodeError:
-            logger.warning("Failed to parse LLM response, falling back to rule-based detection")
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.warning(f"Failed to parse LLM response: {e}, falling back to rule-based detection")
             return detect_header_row_smart(df)
             
     except Exception as e:
-        logger.warning(f"LLM header detection failed: {str(e)}, falling back to rule-based detection")
+        logger.warning(f"LLM header detection error: {str(e)}, falling back to rule-based detection")
         return detect_header_row_smart(df)
 
 def llm_generate_column_names(df, existing_columns):
@@ -403,9 +444,30 @@ def clean_excel_basic(input_path, output_path, sheet_name=None):
         logger.info(f"Starting ultra-conservative clean_excel_basic: {input_path}")
         
         # Read the Excel file exactly as is - no headers assumed
-        df = pd.read_excel(input_path, sheet_name=sheet_name, header=None, engine='openpyxl')
-        original_shape = df.shape
-        changes_log.append(f"✓ Loaded Excel file with shape: {original_shape}")
+        try:
+            df = pd.read_excel(input_path, sheet_name=sheet_name, header=None, engine='openpyxl')
+            
+            # Handle case where pandas returns a dict for multiple sheets
+            if isinstance(df, dict):
+                if sheet_name and sheet_name in df:
+                    df = df[sheet_name]
+                else:
+                    # Get the first sheet
+                    df = list(df.values())[0] if df else pd.DataFrame()
+            
+            original_shape = df.shape
+            changes_log.append(f"✓ Loaded Excel file with shape: {original_shape}")
+        except Exception as e:
+            logger.error(f"Error reading Excel file: {e}")
+            changes_log.append(f"❌ Error reading Excel file: {str(e)}")
+            processing_time = time.time() - start_time
+            return pd.DataFrame(), changes_log, processing_time
+        
+        # Check if the DataFrame is completely empty
+        if df.empty or (df.shape[0] == 0 or df.shape[1] == 0):
+            changes_log.append("❌ Error: The Excel file appears to be completely empty")
+            processing_time = time.time() - start_time
+            return pd.DataFrame(), changes_log, processing_time
         
         # Step 1: Remove ONLY completely empty rows (all values are NaN)
         initial_rows = len(df)
@@ -414,12 +476,24 @@ def clean_excel_basic(input_path, output_path, sheet_name=None):
         if rows_removed > 0:
             changes_log.append(f"✓ Removed {rows_removed} completely empty rows")
         
+        # Check if DataFrame is empty after removing empty rows
+        if df.empty or len(df) == 0:
+            changes_log.append("❌ Error: All rows in the Excel file are empty")
+            processing_time = time.time() - start_time
+            return pd.DataFrame(), changes_log, processing_time
+        
         # Step 2: Remove ONLY completely empty columns (all values are NaN)
         initial_cols = len(df.columns)
         df = df.dropna(axis=1, how='all')
         cols_removed = initial_cols - len(df.columns)
         if cols_removed > 0:
             changes_log.append(f"✓ Removed {cols_removed} completely empty columns")
+        
+        # Check if DataFrame has no columns after removing empty columns
+        if df.empty or len(df.columns) == 0:
+            changes_log.append("❌ Error: All columns in the Excel file are empty")
+            processing_time = time.time() - start_time
+            return pd.DataFrame(), changes_log, processing_time
         
         # Step 3: LLM-powered smart header detection with fallback
         header_row_idx = llm_detect_header_row(df)
@@ -572,7 +646,7 @@ def detect_header_row_smart(df):
     Enhanced smart header detection with better pattern recognition
     Returns the index of the header row, or -1 if no clear header
     """
-    if df.empty:
+    if df.empty or len(df.columns) == 0:
         return -1
     
     # Check first 15 rows for potential headers (increased from 10)
@@ -580,80 +654,98 @@ def detect_header_row_smart(df):
     header_scores = []
     
     for row_idx in range(max_check):
-        row_data = df.iloc[row_idx]
-        non_null = row_data.dropna()
-        
-        if len(non_null) == 0:
-            header_scores.append(0)
-            continue
-        
-        # Calculate header likelihood score
-        score = 0
-        string_count = 0
-        numeric_count = 0
-        header_like_count = 0
-        
-        for val in non_null:
-            val_str = str(val).strip().lower()
+        try:
+            row_data = df.iloc[row_idx]
+            non_null = row_data.dropna()
             
-            if isinstance(val, str) or (isinstance(val, (int, float)) and not str(val).replace('.','').replace('-','').isdigit()):
-                # Check for header-like characteristics
-                header_indicators = [
-                    len(val_str) > 2,  # Not too short
-                    any(c.isalpha() for c in val_str),  # Contains letters
-                    val_str not in ['nan', 'null', '', '0', '1'],  # Not common data values
-                    not val_str.replace('.','').replace('-','').replace(' ','').isdigit(),  # Not purely numeric
-                    any(keyword in val_str for keyword in ['name', 'id', 'date', 'amount', 'total', 'code', 'number', 'address', 'phone', 'email', 'status', 'type', 'description'])  # Common header keywords
-                ]
+            if len(non_null) == 0:
+                header_scores.append(0)
+                continue
+            
+            # Calculate header likelihood score
+            score = 0
+            string_count = 0
+            numeric_count = 0
+            header_like_count = 0
+            
+            for val in non_null:
+                val_str = str(val).strip().lower()
                 
-                if sum(header_indicators) >= 3:
-                    header_like_count += 1
+                # Check if value is string-like
+                is_string_like = isinstance(val, str) or (
+                    not pd.isna(val) and 
+                    not (isinstance(val, (int, float)) and str(val).replace('.','').replace('-','').isdigit())
+                )
+                
+                if is_string_like:
+                    # Check for header-like characteristics
+                    header_indicators = [
+                        len(val_str) > 2,  # Not too short
+                        any(c.isalpha() for c in val_str),  # Contains letters
+                        val_str not in ['nan', 'null', 'none', '', '0', '1', 'true', 'false'],  # Not common data values
+                        not val_str.replace('.','').replace('-','').replace(' ','').isdigit(),  # Not purely numeric
+                        any(keyword in val_str for keyword in [
+                            'name', 'id', 'date', 'amount', 'total', 'price', 'cost',
+                            'code', 'number', 'address', 'phone', 'email', 'status', 
+                            'type', 'description', 'category', 'customer', 'product',
+                            'quantity', 'order', 'invoice', 'payment', 'reference'
+                        ])  # Common header keywords
+                    ]
+                    
+                    if sum(header_indicators) >= 3:
+                        header_like_count += 1
+                        score += 3
+                    elif sum(header_indicators) >= 2:
+                        score += 2
+                    
+                    string_count += 1
+                else:
+                    numeric_count += 1
+                    # Penalize if it looks like data
+                    if isinstance(val, (int, float)) and val > 100:
+                        score -= 1
+        
+            # Boost score based on string ratio
+            if len(non_null) > 0:
+                string_ratio = string_count / len(non_null)
+                if string_ratio >= 0.8:
+                    score += 5
+                elif string_ratio >= 0.6:
                     score += 3
-                elif sum(header_indicators) >= 2:
-                    score += 2
-                
-                string_count += 1
-            else:
-                numeric_count += 1
-                # Penalize if it looks like data
-                if isinstance(val, (int, float)) and val > 100:
-                    score -= 1
-        
-        # Boost score based on string ratio
-        if len(non_null) > 0:
-            string_ratio = string_count / len(non_null)
-            if string_ratio >= 0.8:
-                score += 5
-            elif string_ratio >= 0.6:
+                elif string_ratio >= 0.4:
+                    score += 1
+            
+            # Boost score if most values look like headers
+            if len(non_null) > 0 and header_like_count / len(non_null) >= 0.6:
+                score += 4
+            
+            # Check if next rows look more like data
+            data_like_next = 0
+            for next_idx in range(row_idx + 1, min(row_idx + 4, len(df))):
+                if next_idx < len(df):
+                    try:
+                        next_row = df.iloc[next_idx].dropna()
+                        if len(next_row) > 0:
+                            numeric_in_next = sum(1 for v in next_row if isinstance(v, (int, float)) or 
+                                                (isinstance(v, str) and str(v).replace('.','').replace('-','').isdigit()))
+                            if numeric_in_next / len(next_row) > 0.4:
+                                data_like_next += 1
+                    except:
+                        pass
+            
+            if data_like_next >= 2:
                 score += 3
-            elif string_ratio >= 0.4:
+            elif data_like_next >= 1:
                 score += 1
-        
-        # Boost score if most values look like headers
-        if len(non_null) > 0 and header_like_count / len(non_null) >= 0.6:
-            score += 4
-        
-        # Check if next rows look more like data
-        data_like_next = 0
-        for next_idx in range(row_idx + 1, min(row_idx + 4, len(df))):
-            if next_idx < len(df):
-                next_row = df.iloc[next_idx].dropna()
-                if len(next_row) > 0:
-                    numeric_in_next = sum(1 for v in next_row if isinstance(v, (int, float)) or 
-                                        (isinstance(v, str) and v.replace('.','').replace('-','').isdigit()))
-                    if numeric_in_next / len(next_row) > 0.4:
-                        data_like_next += 1
-        
-        if data_like_next >= 2:
-            score += 3
-        elif data_like_next >= 1:
-            score += 1
-        
-        # Penalize if row is too early and sparse
-        if row_idx > 0 and len(non_null) < len(df.columns) * 0.3:
-            score -= 2
-        
-        header_scores.append(score)
+            
+            # Penalize if row is too early and sparse
+            if row_idx > 0 and len(non_null) < len(df.columns) * 0.3:
+                score -= 2
+            
+            header_scores.append(score)
+        except Exception as e:
+            logger.warning(f"Error processing row {row_idx} for header detection: {e}")
+            header_scores.append(0)
     
     # Find the row with highest score above threshold
     if header_scores:
