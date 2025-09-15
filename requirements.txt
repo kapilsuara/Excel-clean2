@@ -12,4 +12,3 @@ aiofiles
 boto3
 botocore
 openai
-ai_service 
