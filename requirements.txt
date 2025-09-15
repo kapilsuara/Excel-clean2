@@ -11,3 +11,4 @@ pydantic
 aiofiles
 boto3
 botocore
+openai
