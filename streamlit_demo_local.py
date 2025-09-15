@@ -24,9 +24,13 @@ load_dotenv(override=True)  # override=True ensures .env takes precedence
 
 # Import AI service with fallback
 from ai_service import make_ai_call, get_ai_service
+# Import config for API key
+from config import get_anthropic_api_key
 
 # Import format validators
 from format_validators import FormatValidator, validate_and_flag_formats
+# Import data quality scorer for GIGO
+from data_quality_scorer import assess_data_quality
 
 # Check if AI service is available
 ai_service = get_ai_service()
@@ -187,8 +191,8 @@ def llm_detect_header_row(df, max_rows_to_analyze=20):
         int: Header row index (0-based) or -1 if no header found
     """
     try:
-        client = get_anthropic_client()
-        if not client:
+        # Use the new AI service with fallback
+        if not get_ai_service().is_available():
             logger.error("AI service not available for header detection")
             return -1  # AI-only detection, no manual fallback
         
@@ -242,18 +246,41 @@ Data sample (first {len(sample_data)} rows):
 {json.dumps(sample_data, indent=2)}
 
 CRITICAL Rules for header detection:
-1. Headers contain descriptive labels (like 'Customer Name', 'Order Date', 'Amount')
-2. Headers are NOT data values (not actual names, dates, or numbers)
-3. Look for the row where BELOW it, the data becomes consistent (numbers stay numeric, dates stay dates)
-4. Headers often have these keywords: name, id, date, amount, total, code, number, address, phone, email, status, type, description, price, quantity, customer, product, category, sales, revenue, cost, item, value, count, etc.
-5. If row 0 has values like "John Smith", "2024-01-15", "1234.56" - these are DATA, not headers!
-6. Headers should have mostly text values that describe what's in the column
-7. Check the transition point - where descriptive text changes to actual data values
-8. Sometimes there's no header at all - in that case return -1
 
-Analyze carefully:
-- Is row 0 actually headers or is it the first data row?
-- Do the values in row 0 describe what's below, or are they examples of the data itself?
+1. **HEADERS ARE DESCRIPTIVE LABELS**, not actual data:
+   - GOOD headers: "Customer Name", "Order Date", "GST Number", "Amount", "Phone", "Email"
+   - BAD (data, not headers): "John Smith", "2024-01-15", "33ABCDE9999F1Z2", "1234.56", "+91-9876543210"
+
+2. **SPECIFIC DATA PATTERNS TO RECOGNIZE AS DATA (NOT HEADERS)**:
+   - GST Numbers: Pattern like "33ABCDE9999F1Z2" (2 digits + 5 letters + 4 digits + alphanumeric)
+   - Dates: "2024-01-15", "15/01/2024", "Jan 15, 2024"
+   - Phone numbers: "+91-9876543210", "(555) 123-4567"
+   - Email addresses: "user@example.com"
+   - Numbers/amounts: "1234.56", "$1,234.56", "1000"
+   - Actual names: "John Smith", "ABC Corporation"
+   - Addresses: "123 Main St", "New Delhi 110001"
+
+3. **HOW TO IDENTIFY THE HEADER ROW**:
+   - Look for the row where BELOW it, data becomes consistent in type
+   - Headers describe what the column contains ("GST Number" not "33ABCDE9999F1Z2")
+   - Headers typically use generic/descriptive terms, not specific instances
+   - Check rows 0, 1, 2, and 3 - headers might not be in row 0
+
+4. **COMMON HEADER KEYWORDS**:
+   - GST, Tax, Number, ID, Code, Date, Name, Address, Phone, Email, Amount, Price, Quantity
+   - Customer, Vendor, Product, Description, Status, Type, Category
+   - Total, Subtotal, Discount, Rate, Percentage
+
+5. **WARNING SIGNS OF WRONG HEADER DETECTION**:
+   - If you see specific GST numbers, dates, or amounts in what you think is the header row
+   - If the values look like actual business data rather than column descriptions
+   - If most values are numbers or dates rather than descriptive text
+
+Analyze each row carefully:
+- Row 0: Check if it contains descriptive labels or actual data
+- Row 1: Could this be the real header if row 0 is a title or data?
+- Row 2-3: Sometimes Excel files have multiple title rows before headers
+- Look for the TRANSITION from descriptive text to actual data values
 
 Return ONLY a JSON object:
 {{
@@ -265,13 +292,12 @@ Return ONLY a JSON object:
 
 If no header exists, return header_row_index: -1"""
 
-        response = client.messages.create(
-            model="claude-3-5-sonnet-20241022",
-            max_tokens=400,
-            messages=[{"role": "user", "content": prompt}]
-        )
+        # Use the AI service with fallback support
+        response_text = make_ai_call(prompt, max_tokens=400)
         
-        response_text = response.content[0].text.strip()
+        if not response_text:
+            logger.error("AI service failed to respond for header detection")
+            return -1
         
         # Parse JSON response
         try:
@@ -306,12 +332,12 @@ def detect_and_standardize_formats(df):
     Detect and standardize universal formats in DataFrame columns
     Uses LLM to identify format patterns and apply standardization
     """
+    changes_made = []  # Initialize at the beginning to avoid UnboundLocalError
     try:
-        client = get_anthropic_client()
-        if not client:
-            return df, []
+        # Use the new AI service with fallback
+        if not get_ai_service().is_available():
+            return df, changes_made
         
-        changes_made = []
         
         for col in df.columns:
             # Skip if column has too many nulls
@@ -357,14 +383,15 @@ For phone numbers, use international format: +XX XXXX XXXXXX
 For percentages, use XX.XX% format.
 """
 
-            response = client.messages.create(
-                model="claude-3-5-sonnet-20241022",
-                max_tokens=400,
-                messages=[{"role": "user", "content": prompt}]
-            )
+            # Use the AI service with fallback support
+            response_text = make_ai_call(prompt, max_tokens=400)
+            
+            if not response_text:
+                logger.warning(f"AI service failed for format detection on column '{col}'")
+                continue
             
             try:
-                result = json.loads(response.content[0].text.strip())
+                result = json.loads(response_text)
                 format_type = result.get('format_type', 'none')
                 confidence = result.get('confidence', 0.0)
                 transformation_code = result.get('transformation_code', '')
@@ -399,6 +426,9 @@ For percentages, use XX.XX% format.
                 
     except Exception as e:
         logger.error(f"Format detection and standardization failed: {str(e)}")
+        # Ensure changes_made exists even if there was an early error
+        if 'changes_made' not in locals():
+            changes_made = []
     
     return df, changes_made
 
@@ -417,8 +447,8 @@ def llm_generate_column_names(df, existing_columns):
         list: Updated column names with LLM suggestions for unnamed columns
     """
     try:
-        client = get_anthropic_client()
-        if not client:
+        # Use the new AI service with fallback
+        if not get_ai_service().is_available():
             return existing_columns
         
         # Analyze only unnamed columns
@@ -455,13 +485,12 @@ Return ONLY a JSON object mapping column indices to names:
     "column_2": "Transaction_Date"
 }}"""
 
-        response = client.messages.create(
-            model="claude-3-5-sonnet-20241022",
-            max_tokens=400,
-            messages=[{"role": "user", "content": prompt}]
-        )
+        # Use the AI service with fallback support
+        response_text = make_ai_call(prompt, max_tokens=400)
         
-        response_text = response.content[0].text.strip()
+        if not response_text:
+            logger.warning("AI service failed for column name generation")
+            return existing_columns
         
         try:
             name_suggestions = json.loads(response_text)
@@ -491,8 +520,8 @@ def llm_analyze_data_quality(df, changes_log):
     For comprehensive analysis, use ai_analyze_df() function.
     """
     try:
-        client = get_anthropic_client()
-        if not client:
+        # Use the new AI service with fallback
+        if not get_ai_service().is_available():
             return changes_log
         
         # Create a minimal summary for quick analysis (less data than ai_analyze_df)
@@ -523,13 +552,12 @@ Return ONLY a JSON array of strings. Example:
 
 Focus on format/type improvements only. No data removal."""
 
-        response = client.messages.create(
-            model="claude-3-5-sonnet-20241022",
-            max_tokens=200,  # Reduced for faster response
-            messages=[{"role": "user", "content": prompt}]
-        )
+        # Use the AI service with fallback support
+        response_text = make_ai_call(prompt, max_tokens=200)  # Reduced for faster response
         
-        response_text = response.content[0].text.strip()
+        if not response_text:
+            logger.warning("AI service failed for data quality analysis")
+            return changes_log
         
         try:
             suggestions = json.loads(response_text)
@@ -633,12 +661,28 @@ def clean_excel_basic(input_path, output_path, sheet_name=None):
             for i, header_val in enumerate(header_values):
                 if header_val and header_val != '' and header_val != 'nan':
                     col_name = str(header_val).strip()
+                    
+                    # Clean up the column name - remove data-like values
+                    # Check if this looks like actual data (GST numbers, dates, etc.)
+                    if len(col_name) > 50:  # Too long to be a header
+                        col_name = f"Column_{i+1}"
+                    elif re.match(r'^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[0-9A-Z]{1}[Z]{1}[0-9A-Z]{1}$', col_name):  # GST pattern
+                        logger.warning(f"Detected GST number '{col_name}' as header - using generic name")
+                        col_name = f"Column_{i+1}"
+                    elif re.match(r'^\d{4}-\d{2}-\d{2}', col_name) or re.match(r'^\d{2}/\d{2}/\d{4}', col_name):  # Date pattern
+                        logger.warning(f"Detected date '{col_name}' as header - using generic name")
+                        col_name = f"Column_{i+1}"
+                    elif re.match(r'^[\d,]+\.?\d*$', col_name):  # Number pattern
+                        logger.warning(f"Detected number '{col_name}' as header - using generic name")
+                        col_name = f"Column_{i+1}"
+                    
                     # Handle duplicate column names
-                    if col_name in seen_names:
-                        seen_names[col_name] += 1
-                        col_name = f"{col_name}_{seen_names[col_name]}"
-                    else:
-                        seen_names[col_name] = 0
+                    if col_name != f"Column_{i+1}":  # Only check duplicates for non-generic names
+                        if col_name in seen_names:
+                            seen_names[col_name] += 1
+                            col_name = f"{col_name}_{seen_names[col_name]}"
+                        else:
+                            seen_names[col_name] = 0
                 else:
                     col_name = f"Column_{i+1}"
                 new_columns.append(col_name)
@@ -662,12 +706,27 @@ def clean_excel_basic(input_path, output_path, sheet_name=None):
                     col_name = f"Column_{i+1}"
                 else:
                     col_name = str(col).strip()
+                    
+                    # Clean up the column name - remove data-like values
+                    if len(col_name) > 50:  # Too long to be a header
+                        col_name = f"Column_{i+1}"
+                    elif re.match(r'^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[0-9A-Z]{1}[Z]{1}[0-9A-Z]{1}$', col_name):  # GST pattern
+                        logger.warning(f"Detected GST number '{col_name}' as header - using generic name")
+                        col_name = f"Column_{i+1}"
+                    elif re.match(r'^\d{4}-\d{2}-\d{2}', col_name) or re.match(r'^\d{2}/\d{2}/\d{4}', col_name):  # Date pattern
+                        logger.warning(f"Detected date '{col_name}' as header - using generic name")
+                        col_name = f"Column_{i+1}"
+                    elif re.match(r'^[\d,]+\.?\d*$', col_name):  # Number pattern
+                        logger.warning(f"Detected number '{col_name}' as header - using generic name")
+                        col_name = f"Column_{i+1}"
+                    
                     # Handle duplicates
-                    if col_name in seen_names:
-                        seen_names[col_name] += 1
-                        col_name = f"{col_name}_{seen_names[col_name]}"
-                    else:
-                        seen_names[col_name] = 0
+                    if col_name != f"Column_{i+1}":  # Only check duplicates for non-generic names
+                        if col_name in seen_names:
+                            seen_names[col_name] += 1
+                            col_name = f"{col_name}_{seen_names[col_name]}"
+                        else:
+                            seen_names[col_name] = 0
                 new_columns.append(col_name)
             
             df.columns = new_columns
@@ -794,8 +853,8 @@ def clean_excel_basic(input_path, output_path, sheet_name=None):
 def ai_analyze_df(df):
     """Enhanced AI analysis with comprehensive metadata"""
     try:
-        client = get_anthropic_client()
-        if not client:
+        # Use the new AI service with fallback
+        if not get_ai_service().is_available():
             return None, ["AI service not available - check API key"]
         
         # Limit DataFrame size to prevent overwhelming the AI
@@ -906,13 +965,12 @@ Return ONLY valid JSON with this exact structure:
 
 Keep responses concise. Maximum 3-5 items per list."""
         
-        response = client.messages.create(
-            model="claude-3-5-sonnet-20241022",
-            max_tokens=1000,
-            messages=[{"role": "user", "content": prompt}]
-        )
+        # Use the AI service with fallback support
+        response_text = make_ai_call(prompt, max_tokens=1000)
         
-        response_text = response.content[0].text.strip()
+        if not response_text:
+            logger.error("AI service failed for dataframe analysis")
+            return None, ["AI service failed to respond"]
         
         # Try to extract JSON from the response
         try:
@@ -968,8 +1026,8 @@ Keep responses concise. Maximum 3-5 items per list."""
 def apply_ai_suggestions(df, selected_suggestions):
     """Apply AI suggestions with data preservation"""
     try:
-        client = get_anthropic_client()
-        if not client:
+        # Use the new AI service with fallback
+        if not get_ai_service().is_available():
             return df, "AI service not available"
         
         # Get current shape for validation
@@ -999,13 +1057,13 @@ Example transformations:
 - df['col'] = pd.to_numeric(df['col'], errors='ignore')  # Convert types safely
 - df.columns = df.columns.str.replace(' ', '_')  # Clean column names"""
         
-        response = client.messages.create(
-            model="claude-3-5-sonnet-20241022",
-            max_tokens=800,
-            messages=[{"role": "user", "content": prompt}]
-        )
+        # Use the AI service with fallback support
+        response_text = make_ai_call(prompt, max_tokens=800)
         
-        code = response.content[0].text.strip()
+        if not response_text:
+            return df, "❌ AI service failed to generate suggestions"
+        
+        code = response_text
         
         # Remove any code blocks markers if present
         if '```python' in code:
@@ -1030,8 +1088,8 @@ Example transformations:
 def apply_user_query_to_df(df, query):
     """Apply user query"""
     try:
-        client = get_anthropic_client()
-        if not client:
+        # Use the new AI service with fallback
+        if not get_ai_service().is_available():
             return df, "AI service not available"
         
         df_info = f"Columns: {list(df.columns)}\nSample data:\n{df.head(3).to_string()}"
@@ -1044,13 +1102,13 @@ User query: {query}
 Generate Python pandas code to modify 'df'. Do not fill missing values. Do not remove columns unless completely empty with no name. Only return executable code.
 Example: df = df.rename(columns={{'Col1': 'Name'}})"""
         
-        response = client.messages.create(
-            model="claude-3-5-sonnet-20241022",
-            max_tokens=300,
-            messages=[{"role": "user", "content": prompt}]
-        )
+        # Use the AI service with fallback support
+        response_text = make_ai_call(prompt, max_tokens=300)
         
-        code = response.content[0].text.strip()
+        if not response_text:
+            return df, "❌ AI service failed to process query"
+        
+        code = response_text
         
         local_vars = {'df': df.copy(), 'pd': pd, 'np': np}
         exec(code, {}, local_vars)
@@ -1204,9 +1262,17 @@ def apply_format_highlighting(df: pd.DataFrame, format_flags: List[Dict]) -> pd.
         column_rename = {}
         for col in display_df.columns:
             if col in format_info:
-                format_name = format_info[col]['format_name'].replace('_', ' ')
+                format_name = format_info[col]['format_name'].replace('_', ' ').upper()
                 mismatch_count = format_info[col]['mismatch_count']
-                column_rename[col] = f"{col} 🚨 {format_name} ({mismatch_count} errors)"
+                # Keep column name clean and add format info separately
+                # Don't include the actual data value in the display
+                clean_col = col.split()[0] if ' ' in col else col  # Get first word if there are spaces
+                
+                # Special handling for certain column types
+                if 'GST' in format_name:
+                    column_rename[col] = f"{col} [🚨 {mismatch_count} format errors]"
+                else:
+                    column_rename[col] = f"{col} [🚨 {format_name}: {mismatch_count} errors]"
         
         # Rename columns if there are format issues
         if column_rename:
@@ -1535,20 +1601,91 @@ def main():
                             if f.exists():
                                 f.unlink()
                         
-                        progress_bar.progress(100)
-                        st.success("✅ Cleaned!")
+                        progress_bar.progress(90)
                         
-                        col1, col2, col3 = st.columns(3)
+                        # GIGO Check - Assess data quality
+                        score, quality_details, recommendation, cleanup_suggestions = assess_data_quality(df, header_detected=True)
+                        
+                        progress_bar.progress(100)
+                        
+                        # Display quality score with color coding
+                        if score < 30:
+                            st.error(f"🗑️ **GARBAGE DATA DETECTED!** Quality Score: {score}/100")
+                            st.error(recommendation)
+                            st.markdown("### ⚠️ Critical Issues Found:")
+                            for issue in quality_details['issues']:
+                                st.write(f"• {issue}")
+                            st.markdown("### 🔧 Required Actions:")
+                            st.warning("This data requires significant manual cleanup before it can be properly processed.")
+                            st.info("Options:\n1. Use AI Chat assistance for guided cleanup\n2. Manually prepare data in Excel\n3. Use specialized data cleaning tools")
+                            for suggestion in cleanup_suggestions:
+                                st.write(f"• {suggestion}")
+                        elif score < 50:
+                            st.warning(f"⚠️ Poor Data Quality: {score}/100")
+                            st.warning(recommendation)
+                        elif score < 70:
+                            st.info(f"📊 Fair Data Quality: {score}/100")
+                            st.info(recommendation)
+                        elif score < 85:
+                            st.success(f"✅ Good Data Quality: {score}/100")
+                            st.success(recommendation)
+                        else:
+                            st.success(f"🌟 Excellent Data Quality: {score}/100")
+                            st.success(recommendation)
+                        
+                        # Show metrics
+                        col1, col2, col3, col4 = st.columns(4)
                         with col1:
-                            st.metric("Rows", df.shape[0])
+                            st.metric("Quality Score", f"{score}/100")
                         with col2:
-                            st.metric("Columns", df.shape[1])
+                            st.metric("Rows", df.shape[0])
                         with col3:
+                            st.metric("Columns", df.shape[1])
+                        with col4:
                             st.metric("Time", f"{processing_time:.2f}s")
                         
                         with st.expander("📋 Changes", expanded=True):
                             for change in changes_log:
                                 st.write(change)
+                        
+                        # Show quality breakdown
+                        with st.expander("📊 Data Quality Details", expanded=(score < 50)):
+                            st.markdown("### Quality Score Breakdown:")
+                            
+                            # Create a visual representation of scores
+                            score_cols = st.columns(3)
+                            for idx, (component, comp_score) in enumerate(quality_details['scores'].items()):
+                                col_idx = idx % 3
+                                with score_cols[col_idx]:
+                                    # Color code based on score
+                                    if comp_score < 30:
+                                        color = "🔴"
+                                    elif comp_score < 50:
+                                        color = "🟠"
+                                    elif comp_score < 70:
+                                        color = "🟡"
+                                    elif comp_score < 85:
+                                        color = "🟢"
+                                    else:
+                                        color = "✅"
+                                    
+                                    component_name = component.replace('_', ' ').title()
+                                    st.metric(f"{color} {component_name}", f"{comp_score:.0f}/100")
+                            
+                            st.markdown("### Data Statistics:")
+                            for stat_name, stat_value in quality_details['stats'].items():
+                                stat_display = stat_name.replace('_', ' ').title()
+                                st.write(f"• **{stat_display}:** {stat_value}")
+                            
+                            if quality_details['issues']:
+                                st.markdown("### Issues Detected:")
+                                for issue in quality_details['issues']:
+                                    st.write(f"• {issue}")
+                            
+                            if cleanup_suggestions:
+                                st.markdown("### Recommended Actions:")
+                                for suggestion in cleanup_suggestions:
+                                    st.write(f"• {suggestion}")
                         
                         # Convert only the specific cleaned sheet to JSON
                         cleaned_excel_data = convert_excel_to_json(cleaned_content, specific_sheet=selected_sheet)
@@ -1782,3 +1919,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+#      in streamlit_demo_local.py , I want to add one more functionility that is garbage in garbage out , if      │
+# │   data quality score is below 30 then assign it as garbage out means you have to clean it with our AI chat   │
+# │   bot or using manual cleanup method , but how you will determine data quality score it depens on several    │
+# │   factors missing value , 
