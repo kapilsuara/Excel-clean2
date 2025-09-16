@@ -9,11 +9,11 @@ from typing import Optional
 
 def get_config_value(key: str, section: Optional[str] = None, default: Optional[str] = None) -> Optional[str]:
     """
-    Get configuration value from environment variables or Streamlit secrets.
+    Get configuration value from Streamlit secrets or environment variables.
     
     Priority:
-    1. Environment variables (for local development with .env)
-    2. Streamlit secrets (for deployment)
+    1. Streamlit secrets (for deployment)
+    2. Environment variables (for local development with .env)
     3. Default value
     
     Args:
@@ -24,42 +24,60 @@ def get_config_value(key: str, section: Optional[str] = None, default: Optional[
     Returns:
         Configuration value or default
     """
-    # Try environment variables first (prioritize .env file)
+    # Try Streamlit secrets first (for deployment)
+    try:
+        if hasattr(st, 'secrets'):
+            if section:
+                # Access nested configuration
+                if section in st.secrets:
+                    if key in st.secrets[section]:
+                        return st.secrets[section][key]
+            else:
+                # Access top-level configuration
+                if key in st.secrets:
+                    return st.secrets[key]
+    except Exception:
+        # Streamlit secrets not available (local development)
+        pass
+    
+    # Fall back to environment variables (for local development)
     env_key = f"{section}_{key}" if section else key
     env_value = os.getenv(env_key.upper())
     if env_value:
         return env_value
-    
-    # Fall back to Streamlit secrets
-    try:
-        if section:
-            # Access nested configuration
-            if section in st.secrets:
-                if key in st.secrets[section]:
-                    return st.secrets[section][key]
-        else:
-            # Access top-level configuration
-            if key in st.secrets:
-                return st.secrets[key]
-    except Exception:
-        # Streamlit secrets not available (local development)
-        pass
     
     # Return default
     return default
 
 # API Keys
 def get_anthropic_api_key() -> Optional[str]:
-    """Get Anthropic API key from environment or secrets."""
-    # First try direct environment variable (from .env)
+    """Get Anthropic API key from Streamlit secrets or environment."""
+    # Prioritize Streamlit secrets for deployment
+    try:
+        if hasattr(st, 'secrets') and 'ANTHROPIC_API_KEY' in st.secrets:
+            return st.secrets['ANTHROPIC_API_KEY']
+    except:
+        pass
+    # Fall back to environment variable (from .env)
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if api_key:
         return api_key
-    # Fall back to config value (which also checks env and secrets)
+    # Finally try config value (which checks both)
     return get_config_value("ANTHROPIC_API_KEY")
 
 def get_openai_api_key() -> Optional[str]:
-    """Get OpenAI API key from secrets or environment."""
+    """Get OpenAI API key from Streamlit secrets or environment."""
+    # Prioritize Streamlit secrets for deployment
+    try:
+        if hasattr(st, 'secrets') and 'OPENAI_API_KEY' in st.secrets:
+            return st.secrets['OPENAI_API_KEY']
+    except:
+        pass
+    # Fall back to environment variable
+    api_key = os.getenv("OPENAI_API_KEY")
+    if api_key:
+        return api_key
+    # Finally try config value with section
     return get_config_value("OPENAI_API_KEY", section="openai")
 
 # AWS Configuration

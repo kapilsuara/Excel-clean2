@@ -48,25 +48,37 @@ class AIService:
         self._initialize_clients()
     
     def _get_api_keys(self) -> Tuple[Optional[str], Optional[str]]:
-        """Get API keys from Streamlit secrets or environment variables"""
+        """Get API keys from Streamlit secrets (priority) or environment variables (fallback)"""
         anthropic_key = None
         openai_key = None
         
-        # Try Streamlit secrets first
+        # Try Streamlit secrets first (for deployment)
         try:
             if hasattr(st, 'secrets'):
+                # Check for keys in st.secrets
                 if 'ANTHROPIC_API_KEY' in st.secrets:
                     anthropic_key = st.secrets['ANTHROPIC_API_KEY']
+                    logger.info("Anthropic API key loaded from Streamlit secrets")
                 if 'OPENAI_API_KEY' in st.secrets:
                     openai_key = st.secrets['OPENAI_API_KEY']
-        except:
-            pass
+                    logger.info("OpenAI API key loaded from Streamlit secrets")
+        except Exception as e:
+            logger.debug(f"Could not load from Streamlit secrets: {e}")
         
-        # Fall back to environment variables
+        # Fall back to environment variables (for local development)
         if not anthropic_key:
             anthropic_key = os.getenv('ANTHROPIC_API_KEY')
+            if anthropic_key:
+                logger.info("Anthropic API key loaded from environment variables")
+        
         if not openai_key:
             openai_key = os.getenv('OPENAI_API_KEY')
+            if openai_key:
+                logger.info("OpenAI API key loaded from environment variables")
+        
+        # Log warnings if keys are missing
+        if not anthropic_key and not openai_key:
+            logger.warning("No API keys found in Streamlit secrets or environment variables")
         
         return anthropic_key, openai_key
     
