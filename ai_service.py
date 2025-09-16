@@ -6,7 +6,7 @@ import os
 import json
 import logging
 import streamlit as st
-from typing import Optional, Tuple, Any
+from typing import Optional, Tuple, Any, Dict
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -30,12 +30,21 @@ except ImportError:
     logger.warning("OpenAI library not available")
 
 class AIService:
-    """Unified AI service with automatic fallback"""
+    """Unified AI service with automatic fallback and token tracking"""
     
     def __init__(self):
         self.anthropic_client = None
         self.openai_client = None
         self.current_provider = None
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
+        self.total_cost = 0.0
+        # Anthropic Claude pricing (per million tokens)
+        self.anthropic_input_cost = 3.0  # $3 per million input tokens
+        self.anthropic_output_cost = 15.0  # $15 per million output tokens
+        # OpenAI GPT-4 pricing (per million tokens) - approximate
+        self.openai_input_cost = 30.0  # $30 per million input tokens
+        self.openai_output_cost = 60.0  # $60 per million output tokens
         self._initialize_clients()
     
     def _get_api_keys(self) -> Tuple[Optional[str], Optional[str]]:
@@ -89,10 +98,10 @@ class AIService:
             except Exception as e:
                 logger.error(f"Failed to initialize OpenAI: {e}")
     
-    def _call_anthropic(self, prompt: str, max_tokens: int = 400, system_prompt: Optional[str] = None) -> Optional[str]:
-        """Call Anthropic API"""
+    def _call_anthropic(self, prompt: str, max_tokens: int = 400, system_prompt: Optional[str] = None) -> Tuple[Optional[str], int, int]:
+        """Call Anthropic API and track tokens"""
         if not self.anthropic_client:
-            return None
+            return None, 0, 0
         
         try:
             messages = [{"role": "user", "content": prompt}]
@@ -111,7 +120,11 @@ class AIService:
                     messages=messages
                 )
             
-            return response.content[0].text.strip()
+            # Extract token usage from response
+            input_tokens = getattr(response.usage, 'input_tokens', 0)
+            output_tokens = getattr(response.usage, 'output_tokens', 0)
+            
+            return response.content[0].text.strip(), input_tokens, output_tokens
         
         except Exception as e:
             error_msg = str(e).lower()
@@ -120,12 +133,12 @@ class AIService:
                 st.warning("⚠️ Anthropic API has insufficient credits, switching to OpenAI...")
             else:
                 logger.error(f"Anthropic API error: {e}")
-            return None
+            return None, 0, 0
     
-    def _call_openai(self, prompt: str, max_tokens: int = 400, system_prompt: Optional[str] = None) -> Optional[str]:
-        """Call OpenAI API"""
+    def _call_openai(self, prompt: str, max_tokens: int = 400, system_prompt: Optional[str] = None) -> Tuple[Optional[str], int, int]:
+        """Call OpenAI API and track tokens"""
         if not self.openai_client:
-            return None
+            return None, 0, 0
         
         try:
             messages = []
@@ -142,7 +155,10 @@ class AIService:
                     max_tokens=max_tokens,
                     temperature=0.7
                 )
-                return response.choices[0].message.content.strip()
+                # Extract token usage from response
+                input_tokens = getattr(response.usage, 'prompt_tokens', 0)
+                output_tokens = getattr(response.usage, 'completion_tokens', 0)
+                return response.choices[0].message.content.strip(), input_tokens, output_tokens
             else:
                 # OpenAI v0.x or direct API
                 import openai
@@ -152,7 +168,10 @@ class AIService:
                     max_tokens=max_tokens,
                     temperature=0.7
                 )
-                return response.choices[0].message.content.strip()
+                # Extract token usage from response
+                input_tokens = response.get('usage', {}).get('prompt_tokens', 0)
+                output_tokens = response.get('usage', {}).get('completion_tokens', 0)
+                return response.choices[0].message.content.strip(), input_tokens, output_tokens
         
         except Exception as e:
             error_msg = str(e).lower()
@@ -161,11 +180,11 @@ class AIService:
                 st.error("❌ OpenAI API also has insufficient credits")
             else:
                 logger.error(f"OpenAI API error: {e}")
-            return None
+            return None, 0, 0
     
     def call(self, prompt: str, max_tokens: int = 400, system_prompt: Optional[str] = None) -> Optional[str]:
         """
-        Make an AI call with automatic fallback
+        Make an AI call with automatic fallback and token tracking
         
         Args:
             prompt: The user prompt
@@ -177,17 +196,31 @@ class AIService:
         """
         # Try Anthropic first
         if self.anthropic_client:
-            response = self._call_anthropic(prompt, max_tokens, system_prompt)
+            response, input_tokens, output_tokens = self._call_anthropic(prompt, max_tokens, system_prompt)
             if response:
                 self.current_provider = 'anthropic'
+                # Update token tracking
+                self.total_input_tokens += input_tokens
+                self.total_output_tokens += output_tokens
+                # Calculate cost (convert to cost per token)
+                input_cost = (input_tokens / 1_000_000) * self.anthropic_input_cost
+                output_cost = (output_tokens / 1_000_000) * self.anthropic_output_cost
+                self.total_cost += input_cost + output_cost
                 return response
         
         # Fall back to OpenAI
         if self.openai_client:
             st.info("Using OpenAI as fallback...")
-            response = self._call_openai(prompt, max_tokens, system_prompt)
+            response, input_tokens, output_tokens = self._call_openai(prompt, max_tokens, system_prompt)
             if response:
                 self.current_provider = 'openai'
+                # Update token tracking
+                self.total_input_tokens += input_tokens
+                self.total_output_tokens += output_tokens
+                # Calculate cost (convert to cost per token)
+                input_cost = (input_tokens / 1_000_000) * self.openai_input_cost
+                output_cost = (output_tokens / 1_000_000) * self.openai_output_cost
+                self.total_cost += input_cost + output_cost
                 return response
         
         # Both failed
@@ -210,6 +243,22 @@ class AIService:
     def is_available(self) -> bool:
         """Check if any AI service is available"""
         return self.anthropic_client is not None or self.openai_client is not None
+    
+    def get_token_usage(self) -> Dict[str, Any]:
+        """Get current token usage and cost statistics"""
+        return {
+            'input_tokens': self.total_input_tokens,
+            'output_tokens': self.total_output_tokens,
+            'total_tokens': self.total_input_tokens + self.total_output_tokens,
+            'total_cost': self.total_cost,
+            'provider': self.current_provider
+        }
+    
+    def reset_token_usage(self):
+        """Reset token usage counters"""
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
+        self.total_cost = 0.0
 
 # Global AI service instance
 _ai_service = None

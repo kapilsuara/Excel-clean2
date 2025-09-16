@@ -10,34 +10,31 @@ from pathlib import Path
 import openpyxl
 from openpyxl.utils import range_boundaries
 import re
+import shutil
 import logging
 from datetime import datetime
 import anthropic
 from dotenv import load_dotenv
+from config import get_anthropic_api_key, get_aws_config, get_app_settings, get_feature_flags, validate_config
 import time
 import traceback
 from io import BytesIO
 from typing import Optional, List, Dict, Any, Tuple
 
-# Load environment variables from .env file FIRST (before importing config)
-load_dotenv(override=True)  # override=True ensures .env takes precedence
-
-# Import AI service with fallback
-from ai_service import make_ai_call, get_ai_service
-# Import config for API key
-from config import get_anthropic_api_key
-
-# Import format validators
+# Import S3 service and format validators
+from aws_s3_service import s3_service
 from format_validators import FormatValidator, validate_and_flag_formats
-# Import data quality scorer for GIGO
-from data_quality_scorer import assess_data_quality
 
-# Check if AI service is available
-ai_service = get_ai_service()
-if not ai_service.is_available() and 'initialized' not in st.session_state:
+# Load environment variables (fallback for local development)
+load_dotenv()
+
+# Validate configuration
+config_valid, config_errors = validate_config()
+if not config_valid and 'initialized' not in st.session_state:
     st.error("Configuration Error")
-    st.error("• No AI service configured")
-    st.info("Please add ANTHROPIC_API_KEY or OPENAI_API_KEY to .streamlit/secrets.toml or .env file")
+    for error in config_errors:
+        st.error(f"• {error}")
+    st.info("Please check your .streamlit/secrets.toml file or environment variables.")
     st.stop()
 
 # Page configuration
@@ -120,11 +117,7 @@ st.markdown("""
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize session state for local storage
-if 'uploaded_files' not in st.session_state:
-    st.session_state.uploaded_files = {}
-if 'cleaned_files' not in st.session_state:
-    st.session_state.cleaned_files = {}
+# Initialize session state
 if 'current_excel_id' not in st.session_state:
     st.session_state.current_excel_id = None
 if 'current_excel_name' not in st.session_state:
@@ -181,7 +174,7 @@ def fill_merged_cells(ws):
 def llm_detect_header_row(df, max_rows_to_analyze=20):
     """
     AI-powered header detection using LLM to analyze data patterns.
-    Enhanced to better distinguish between headers and data rows.
+    This is the ONLY header detection method - no manual fallbacks.
     
     Args:
         df: DataFrame to analyze
@@ -191,10 +184,10 @@ def llm_detect_header_row(df, max_rows_to_analyze=20):
         int: Header row index (0-based) or -1 if no header found
     """
     try:
-        # Use the new AI service with fallback
-        if not get_ai_service().is_available():
+        client = get_anthropic_client()
+        if not client:
             logger.error("AI service not available for header detection")
-            return 0  # Default to first row as header when AI unavailable
+            return -1  # AI-only detection, no manual fallback
         
         # Prepare metadata about the dataframe
         metadata = {
@@ -234,53 +227,48 @@ def llm_detect_header_row(df, max_rows_to_analyze=20):
                 row_data[f"col_{j}"] = str(val) if pd.notna(val) else "NULL"
             sample_data.append({"row_index": i, "data": row_data})
         
-        # Enhanced prompt that analyzes actual data patterns
-        prompt = f"""Analyze this Excel data to identify which row contains column headers.
+        prompt = f"""Analyze this Excel data and identify the EXACT header row.
 
-CRITICAL: You must look at the ACTUAL DATA VALUES in each column, not just assume based on text that looks like "Date" or "Vendor".
+Metadata:
+- Total rows in file: {metadata['total_rows']}
+- Total columns: {metadata['total_columns']}
+- Column type patterns (first 10 values per column):
+{json.dumps(metadata['column_dtypes'], indent=2)}
 
 Data sample (first {len(sample_data)} rows):
 {json.dumps(sample_data, indent=2)}
 
-Column type analysis (what types of data appear in each column):
-{json.dumps(metadata['column_dtypes'], indent=2)}
+CRITICAL Rules for header detection:
+1. Headers contain descriptive labels (like 'Customer Name', 'Order Date', 'Amount')
+2. Headers are NOT data values (not actual names, dates, or numbers)
+3. Look for the row where BELOW it, the data becomes consistent (numbers stay numeric, dates stay dates)
+4. Headers often have these keywords: name, id, date, amount, total, code, number, address, phone, email, status, type, description, price, quantity, customer, product, category, sales, revenue, cost, item, value, count, etc.
+5. If row 0 has values like "John Smith", "2024-01-15", "1234.56" - these are DATA, not headers!
+6. Headers should have mostly text values that describe what's in the column
+7. Check the transition point - where descriptive text changes to actual data values
+8. Sometimes there's no header at all - in that case return -1
 
-ANALYSIS APPROACH:
-1. Look at row 0 - what does it contain?
-   - If it has words like "Date", "Vendor", "Amount" BUT the rows below have completely different data types, then row 0 is likely the header
-   - If row 0 has similar data types to rows below it, then row 0 might be data, not header
-
-2. Check data consistency:
-   - Headers usually have descriptive text
-   - Data rows usually have consistent types within each column
-   - Look for where the pattern changes from labels to actual data
-
-3. IMPORTANT: Don't assume! 
-   - Just because a cell says "Date" doesn't mean that column contains dates
-   - Look at the ACTUAL VALUES in rows 1, 2, 3, etc. to understand what the column really contains
-   - Example: If row 0 col_0 says "Date" but rows 1-5 col_0 contain numbers like "16795", "1860", then the column doesn't contain dates!
-
-4. Pattern Recognition:
-   - If row 0 has ["Date", "Vendor", "Taxable Amount", "GST", "Invoice Amount"]
-   - But row 1 has ["16795", "09-04-25", "QuickSupply Co.", "3023.1", "19818.1"]
-   - Notice that "Date" column actually contains numbers (16795), not dates!
-   - This means row 0 is the header, even though column names don't match the data
+Analyze carefully:
+- Is row 0 actually headers or is it the first data row?
+- Do the values in row 0 describe what's below, or are they examples of the data itself?
 
 Return ONLY a JSON object:
 {{
-    "header_row_index": 0,  // 0-based index, or -1 if no header found
+    "header_row_index": 0,
     "confidence": 0.95,
-    "reasoning": "Explain what you found in the data",
-    "sample_headers": ["list of detected header values"],
-    "data_mismatch_warning": "Note if column names don't match actual data types"
-}}"""
+    "reasoning": "Clear explanation",
+    "sample_headers": ["list of detected header values if found"]
+}}
 
-        # Use the AI service with fallback support
-        response_text = make_ai_call(prompt, max_tokens=400)
+If no header exists, return header_row_index: -1"""
+
+        response = client.messages.create(
+            model="claude-3-5-sonnet-20241022",
+            max_tokens=400,
+            messages=[{"role": "user", "content": prompt}]
+        )
         
-        if not response_text:
-            logger.error("AI service failed to respond for header detection")
-            return -1
+        response_text = response.content[0].text.strip()
         
         # Parse JSON response
         try:
@@ -310,79 +298,17 @@ Return ONLY a JSON object:
         logger.error(f"LLM header detection failed: {str(e)}")
         return -1
 
-def standardize_dates_without_ai(df):
-    """
-    Detect and standardize date columns to YYYY/MM/DD format without AI
-    This is a fallback function when AI is not available
-    """
-    changes_made = []
-    
-    for col in df.columns:
-        # Skip if column has too many nulls
-        if df[col].isnull().sum() > len(df) * 0.8:
-            continue
-        
-        # Try to detect if column contains dates
-        sample_values = df[col].dropna().head(20)
-        if len(sample_values) < 3:
-            continue
-        
-        # Check if column might contain dates
-        is_date_column = False
-        date_patterns = [
-            r'\d{1,2}[-/]\d{1,2}[-/]\d{2,4}',  # DD/MM/YYYY or MM/DD/YYYY
-            r'\d{4}[-/]\d{1,2}[-/]\d{1,2}',     # YYYY/MM/DD or YYYY-MM-DD
-            r'\d{1,2}-\w{3}-\d{2,4}',           # DD-MMM-YYYY
-            r'\w{3}\s+\d{1,2},?\s+\d{4}',       # MMM DD, YYYY
-        ]
-        
-        # Check if any sample values match date patterns
-        for val in sample_values:
-            if pd.notna(val):
-                str_val = str(val)
-                for pattern in date_patterns:
-                    if re.search(pattern, str_val):
-                        is_date_column = True
-                        break
-            if is_date_column:
-                break
-        
-        # If it looks like a date column, try to convert it
-        if is_date_column:
-            try:
-                # Try to parse dates with pandas
-                original_dtype = df[col].dtype
-                converted_dates = pd.to_datetime(df[col], errors='coerce', dayfirst=True)
-                
-                # Check if conversion was successful for at least 50% of non-null values
-                non_null_count = df[col].notna().sum()
-                successful_conversions = converted_dates.notna().sum()
-                
-                if non_null_count > 0 and successful_conversions / non_null_count > 0.5:
-                    # Convert to YYYY/MM/DD format
-                    df[col] = converted_dates.dt.strftime('%Y/%m/%d')
-                    changes_made.append(f"✓ Standardized '{col}' to YYYY/MM/DD date format")
-                    logger.info(f"Successfully converted column '{col}' to YYYY/MM/DD format")
-            except Exception as e:
-                logger.warning(f"Could not convert column '{col}' to date format: {str(e)}")
-    
-    return df, changes_made
-
 def detect_and_standardize_formats(df):
     """
     Detect and standardize universal formats in DataFrame columns
     Uses LLM to identify format patterns and apply standardization
-    Special focus on converting dates to YYYY/MM/DD format
     """
-    changes_made = []  # Initialize at the beginning to avoid UnboundLocalError
     try:
-        # Use the new AI service with fallback
-        if not get_ai_service().is_available():
-            # Try to detect and convert dates even without AI
-            df, date_changes = standardize_dates_without_ai(df)
-            changes_made.extend(date_changes)
-            return df, changes_made
+        client = get_anthropic_client()
+        if not client:
+            return df, []
         
+        changes_made = []
         
         for col in df.columns:
             # Skip if column has too many nulls
@@ -422,72 +348,54 @@ Return ONLY a JSON object:
     "transformation_code": "pandas code to standardize"
 }}
 
-IMPORTANT: For dates:
-- Set format_type to "date" if dates are detected
-- We will handle the conversion to YYYY/MM/DD format
-- Just identify if it's a date column, don't provide transformation_code for dates
+For dates, use DD/MM/YYYY format.
 For currency, preserve the symbol and use comma separators.
 For phone numbers, use international format: +XX XXXX XXXXXX
 For percentages, use XX.XX% format.
 """
 
-            # Use the AI service with fallback support
-            response_text = make_ai_call(prompt, max_tokens=400)
-            
-            if not response_text:
-                logger.warning(f"AI service failed for format detection on column '{col}'")
-                continue
+            response = client.messages.create(
+                model="claude-3-5-sonnet-20241022",
+                max_tokens=400,
+                messages=[{"role": "user", "content": prompt}]
+            )
             
             try:
-                result = json.loads(response_text)
+                result = json.loads(response.content[0].text.strip())
                 format_type = result.get('format_type', 'none')
                 confidence = result.get('confidence', 0.0)
                 transformation_code = result.get('transformation_code', '')
                 
-                if format_type != 'none' and confidence > 0.7:
+                if format_type != 'none' and confidence > 0.7 and transformation_code:
                     logger.info(f"Column '{col}' detected as {format_type} with confidence {confidence}")
                     
-                    # Special handling for date columns to ensure YYYY/MM/DD format
-                    if format_type == 'date':
-                        try:
-                            # Convert to datetime first
-                            df[col] = pd.to_datetime(df[col], errors='coerce', dayfirst=True)
-                            # Then format as YYYY/MM/DD
-                            df[col] = df[col].dt.strftime('%Y/%m/%d')
-                            changes_made.append(f"✓ Standardized '{col}' to YYYY/MM/DD date format")
-                            logger.info(f"Successfully standardized date column '{col}' to YYYY/MM/DD")
-                        except Exception as e:
-                            logger.warning(f"Failed to standardize date column '{col}': {str(e)}")
-                    elif transformation_code:
-                        # Apply transformation for other format types
-                        try:
-                            # Create a safe execution environment
-                            local_vars = {
-                                'df': df,
-                                'col': col,
-                                'pd': pd,
-                                'np': np,
-                                're': re,
-                                'datetime': datetime
-                            }
-                            
-                            # Execute the transformation code
-                            exec(f"df['{col}'] = {transformation_code}", {}, local_vars)
-                            df = local_vars['df']
-                            
-                            changes_made.append(f"✓ Standardized '{col}' as {format_type} format")
-                            logger.info(f"Successfully standardized column '{col}'")
-                        except Exception as e:
-                            logger.warning(f"Failed to apply transformation to column '{col}': {str(e)}")
+                    # Apply transformation
+                    try:
+                        # Create a safe execution environment
+                        local_vars = {
+                            'df': df,
+                            'col': col,
+                            'pd': pd,
+                            'np': np,
+                            're': re,
+                            'datetime': datetime
+                        }
+                        
+                        # Execute the transformation code
+                        exec(f"df['{col}'] = {transformation_code}", {}, local_vars)
+                        df = local_vars['df']
+                        
+                        changes_made.append(f"✓ Standardized '{col}' as {format_type} format")
+                        logger.info(f"Successfully standardized column '{col}'")
+                        
+                    except Exception as e:
+                        logger.warning(f"Failed to apply transformation to column '{col}': {str(e)}")
                         
             except json.JSONDecodeError:
                 logger.warning(f"Failed to parse format detection for column '{col}'")
                 
     except Exception as e:
         logger.error(f"Format detection and standardization failed: {str(e)}")
-        # Ensure changes_made exists even if there was an early error
-        if 'changes_made' not in locals():
-            changes_made = []
     
     return df, changes_made
 
@@ -506,25 +414,16 @@ def llm_generate_column_names(df, existing_columns):
         list: Updated column names with LLM suggestions for unnamed columns
     """
     try:
-        # Use the new AI service with fallback
-        if not get_ai_service().is_available():
+        client = get_anthropic_client()
+        if not client:
             return existing_columns
         
-        # Analyze only unnamed columns - IMPORTANT: Don't rename existing meaningful columns
+        # Analyze only unnamed columns
         unnamed_indices = []
         column_samples = {}
         
         for i, col in enumerate(existing_columns):
-            # Only process truly unnamed columns, not existing headers like Date, Vendor, etc.
-            col_str = str(col).strip()
-            # Check if this is a generic name that needs renaming
-            is_generic = (pd.isna(col) or 
-                         col_str == '' or 
-                         col_str == 'nan' or
-                         'Unnamed' in col_str or 
-                         re.match(r'^Column_\d+$', col_str))  # Only match Column_1, Column_2 pattern
-            
-            if is_generic:
+            if pd.isna(col) or col == '' or str(col).strip() == '' or 'Unnamed' in str(col) or 'Column_' in str(col):
                 unnamed_indices.append(i)
                 # Get sample data for this column
                 col_data = df.iloc[:, i].dropna().head(10)
@@ -533,48 +432,33 @@ def llm_generate_column_names(df, existing_columns):
         if not unnamed_indices:
             return existing_columns
         
-        # Also include existing column names for context
-        existing_names_context = {f"column_{i}": existing_columns[i] for i in unnamed_indices}
-        
-        prompt = f"""Analyze the actual data in these columns to generate appropriate names.
+        prompt = f"""Generate meaningful column names based on the data content.
 
-IMPORTANT: DO NOT make assumptions based on existing column names! 
-- Just because a column is currently named "Date" doesn't mean it contains dates
-- Look at the ACTUAL DATA VALUES to understand what each column really contains
-
-Current column names (which might be wrong):
-{json.dumps(existing_names_context, indent=2)}
-
-Actual data samples from these columns:
+Column data samples:
 {json.dumps(column_samples, indent=2)}
 
-ANALYSIS INSTRUCTIONS:
-1. Look at the actual data values, not the current column names
-2. Identify what type of data is actually in each column:
-   - Numbers like "16795", "1860" → might be IDs, quantities, or reference numbers
-   - Dates like "09-04-25", "27-04-25" → these are dates
-   - Text like "QuickSupply Co.", "BrightMart123" → company/vendor names
-   - Decimals like "3023.1", "334.8" → amounts, prices, or measurements
-3. Generate names based on what the data ACTUALLY is, not what the header says
+Guidelines:
+1. Use descriptive, business-friendly names
+2. Follow naming conventions: Title_Case_With_Underscores
+3. Be specific but concise
+4. Avoid generic names like "Data" or "Value"
+5. Consider data patterns (emails, dates, numbers, etc.)
+6. Look for patterns in the data to infer meaning
 
-Examples of proper analysis:
-- If column says "Date" but contains ["16795", "1860", "39158"] → name it "Order_ID" or "Reference_Number"
-- If column says "Vendor" but contains ["09-04-25", "27-04-25"] → name it "Transaction_Date" or "Date"
-- If column contains ["QuickSupply Co.", "BrightMart123"] → name it "Vendor_Name" or "Company"
-
-Return ONLY a JSON object mapping column indices to appropriate names based on actual data:
+Return ONLY a JSON object mapping column indices to names:
 {{
-    "column_0": "Reference_ID",
-    "column_1": "Transaction_Date",
-    "column_2": "Vendor_Name"
+    "column_0": "Customer_Email",
+    "column_1": "Order_Amount",
+    "column_2": "Transaction_Date"
 }}"""
 
-        # Use the AI service with fallback support
-        response_text = make_ai_call(prompt, max_tokens=400)
+        response = client.messages.create(
+            model="claude-3-5-sonnet-20241022",
+            max_tokens=400,
+            messages=[{"role": "user", "content": prompt}]
+        )
         
-        if not response_text:
-            logger.warning("AI service failed for column name generation")
-            return existing_columns
+        response_text = response.content[0].text.strip()
         
         try:
             name_suggestions = json.loads(response_text)
@@ -604,8 +488,8 @@ def llm_analyze_data_quality(df, changes_log):
     For comprehensive analysis, use ai_analyze_df() function.
     """
     try:
-        # Use the new AI service with fallback
-        if not get_ai_service().is_available():
+        client = get_anthropic_client()
+        if not client:
             return changes_log
         
         # Create a minimal summary for quick analysis (less data than ai_analyze_df)
@@ -636,12 +520,13 @@ Return ONLY a JSON array of strings. Example:
 
 Focus on format/type improvements only. No data removal."""
 
-        # Use the AI service with fallback support
-        response_text = make_ai_call(prompt, max_tokens=200)  # Reduced for faster response
+        response = client.messages.create(
+            model="claude-3-5-sonnet-20241022",
+            max_tokens=200,  # Reduced for faster response
+            messages=[{"role": "user", "content": prompt}]
+        )
         
-        if not response_text:
-            logger.warning("AI service failed for data quality analysis")
-            return changes_log
+        response_text = response.content[0].text.strip()
         
         try:
             suggestions = json.loads(response_text)
@@ -729,6 +614,8 @@ def clean_excel_basic(input_path, output_path, sheet_name=None):
             changes_log.append(f"✓ Removed {cols_removed} completely empty columns")
         
         # Step 3: AI-powered header detection
+        # NOTE: This uses ONLY AI/LLM for detection - no manual rules or heuristics
+        # The AI analyzes data patterns, column types, and content to identify headers
         header_row_idx = llm_detect_header_row(df)
         logger.info(f"AI header detection result: {header_row_idx}")
         
@@ -745,18 +632,12 @@ def clean_excel_basic(input_path, output_path, sheet_name=None):
             for i, header_val in enumerate(header_values):
                 if header_val and header_val != '' and header_val != 'nan':
                     col_name = str(header_val).strip()
-                    
-                    # Only clean up extremely long or obviously invalid headers
-                    if len(col_name) > 100:  # Extremely long, likely not a header
-                        col_name = f"Column_{i+1}"
-                    
                     # Handle duplicate column names
-                    if col_name != f"Column_{i+1}":  # Only check duplicates for non-generic names
-                        if col_name in seen_names:
-                            seen_names[col_name] += 1
-                            col_name = f"{col_name}_{seen_names[col_name]}"
-                        else:
-                            seen_names[col_name] = 0
+                    if col_name in seen_names:
+                        seen_names[col_name] += 1
+                        col_name = f"{col_name}_{seen_names[col_name]}"
+                    else:
+                        seen_names[col_name] = 0
                 else:
                     col_name = f"Column_{i+1}"
                 new_columns.append(col_name)
@@ -780,18 +661,12 @@ def clean_excel_basic(input_path, output_path, sheet_name=None):
                     col_name = f"Column_{i+1}"
                 else:
                     col_name = str(col).strip()
-                    
-                    # Only clean up extremely long or obviously invalid headers
-                    if len(col_name) > 100:  # Extremely long, likely not a header
-                        col_name = f"Column_{i+1}"
-                    
                     # Handle duplicates
-                    if col_name != f"Column_{i+1}":  # Only check duplicates for non-generic names
-                        if col_name in seen_names:
-                            seen_names[col_name] += 1
-                            col_name = f"{col_name}_{seen_names[col_name]}"
-                        else:
-                            seen_names[col_name] = 0
+                    if col_name in seen_names:
+                        seen_names[col_name] += 1
+                        col_name = f"{col_name}_{seen_names[col_name]}"
+                    else:
+                        seen_names[col_name] = 0
                 new_columns.append(col_name)
             
             df.columns = new_columns
@@ -831,26 +706,15 @@ def clean_excel_basic(input_path, output_path, sheet_name=None):
         df.columns = cleaned_columns
         changes_log.append(f"✓ Cleaned {len(df.columns)} column names")
         
-        # Step 5: Use AI to generate intelligent names ONLY for truly unnamed/generic columns
-        # IMPORTANT: Do NOT rename columns that already have names, even if they seem wrong
+        # Step 5: Use AI to generate intelligent names for unnamed/generic columns
         try:
-            # Only enhance truly generic column names
-            needs_enhancement = False
-            for col in df.columns:
-                if re.match(r'^Column_\d+$', col) or 'Unnamed' in col:
-                    needs_enhancement = True
-                    break
-            
-            if needs_enhancement:
-                llm_enhanced_columns = llm_generate_column_names(df, df.columns.tolist())
-                if llm_enhanced_columns != df.columns.tolist():
-                    df.columns = llm_enhanced_columns
-                    changes_log.append("✓ Enhanced generic column names using AI analysis")
-            else:
-                changes_log.append("✓ Preserved existing column names (no generic columns found)")
+            llm_enhanced_columns = llm_generate_column_names(df, df.columns.tolist())
+            if llm_enhanced_columns != df.columns.tolist():
+                df.columns = llm_enhanced_columns
+                changes_log.append("✓ Enhanced column names using AI analysis")
         except Exception as e:
             logger.warning(f"AI column name enhancement failed: {str(e)}")
-            changes_log.append("⚠️ AI column name enhancement failed, keeping existing names")
+            changes_log.append("⚠️ AI column name enhancement failed, using basic names")
         
         # Step 6: Minimal data cleaning (no data loss)
         for col in df.columns:
@@ -860,19 +724,12 @@ def clean_excel_basic(input_path, output_path, sheet_name=None):
         
         changes_log.append("✓ Trimmed whitespace from text values")
         
-        # Step 7: Detect and standardize universal formats (including dates to YYYY/MM/DD)
+        # Step 7: Detect and standardize universal formats
         df, format_changes = detect_and_standardize_formats(df)
         if format_changes:
             changes_log.append("✓ Applied format standardization:")
             for change in format_changes:
                 changes_log.append(f"  {change}")
-        
-        # Step 7b: Additional date standardization pass (ensures all dates are YYYY/MM/DD)
-        df, date_changes = standardize_dates_without_ai(df)
-        if date_changes:
-            for change in date_changes:
-                if change not in format_changes:  # Avoid duplicate messages
-                    changes_log.append(f"  {change}")
         
         # Step 8: Standardize only obvious missing value representations
         df = df.replace(['NULL', 'null', '#N/A', 'N/A', 'n/a', '#NA'], np.nan)
@@ -936,8 +793,8 @@ def clean_excel_basic(input_path, output_path, sheet_name=None):
 def ai_analyze_df(df):
     """Enhanced AI analysis with comprehensive metadata"""
     try:
-        # Use the new AI service with fallback
-        if not get_ai_service().is_available():
+        client = get_anthropic_client()
+        if not client:
             return None, ["AI service not available - check API key"]
         
         # Limit DataFrame size to prevent overwhelming the AI
@@ -1048,12 +905,13 @@ Return ONLY valid JSON with this exact structure:
 
 Keep responses concise. Maximum 3-5 items per list."""
         
-        # Use the AI service with fallback support
-        response_text = make_ai_call(prompt, max_tokens=1000)
+        response = client.messages.create(
+            model="claude-3-5-sonnet-20241022",
+            max_tokens=1000,
+            messages=[{"role": "user", "content": prompt}]
+        )
         
-        if not response_text:
-            logger.error("AI service failed for dataframe analysis")
-            return None, ["AI service failed to respond"]
+        response_text = response.content[0].text.strip()
         
         # Try to extract JSON from the response
         try:
@@ -1109,8 +967,8 @@ Keep responses concise. Maximum 3-5 items per list."""
 def apply_ai_suggestions(df, selected_suggestions):
     """Apply AI suggestions with data preservation"""
     try:
-        # Use the new AI service with fallback
-        if not get_ai_service().is_available():
+        client = get_anthropic_client()
+        if not client:
             return df, "AI service not available"
         
         # Get current shape for validation
@@ -1140,13 +998,13 @@ Example transformations:
 - df['col'] = pd.to_numeric(df['col'], errors='ignore')  # Convert types safely
 - df.columns = df.columns.str.replace(' ', '_')  # Clean column names"""
         
-        # Use the AI service with fallback support
-        response_text = make_ai_call(prompt, max_tokens=800)
+        response = client.messages.create(
+            model="claude-3-5-sonnet-20241022",
+            max_tokens=800,
+            messages=[{"role": "user", "content": prompt}]
+        )
         
-        if not response_text:
-            return df, "❌ AI service failed to generate suggestions"
-        
-        code = response_text
+        code = response.content[0].text.strip()
         
         # Remove any code blocks markers if present
         if '```python' in code:
@@ -1171,8 +1029,8 @@ Example transformations:
 def apply_user_query_to_df(df, query):
     """Apply user query"""
     try:
-        # Use the new AI service with fallback
-        if not get_ai_service().is_available():
+        client = get_anthropic_client()
+        if not client:
             return df, "AI service not available"
         
         df_info = f"Columns: {list(df.columns)}\nSample data:\n{df.head(3).to_string()}"
@@ -1185,13 +1043,13 @@ User query: {query}
 Generate Python pandas code to modify 'df'. Do not fill missing values. Do not remove columns unless completely empty with no name. Only return executable code.
 Example: df = df.rename(columns={{'Col1': 'Name'}})"""
         
-        # Use the AI service with fallback support
-        response_text = make_ai_call(prompt, max_tokens=300)
+        response = client.messages.create(
+            model="claude-3-5-sonnet-20241022",
+            max_tokens=300,
+            messages=[{"role": "user", "content": prompt}]
+        )
         
-        if not response_text:
-            return df, "❌ AI service failed to process query"
-        
-        code = response_text
+        code = response.content[0].text.strip()
         
         local_vars = {'df': df.copy(), 'pd': pd, 'np': np}
         exec(code, {}, local_vars)
@@ -1213,6 +1071,7 @@ def convert_excel_to_json(file_content: bytes, specific_sheet: str = None) -> Di
         
         if specific_sheet:
             # Process only the specific sheet
+            # Try exact match first
             sheet_to_read = None
             if specific_sheet in excel_file.sheet_names:
                 sheet_to_read = specific_sheet
@@ -1319,7 +1178,7 @@ def display_excel_data(data: Dict[str, Any], title: str = "Excel Data", format_f
         st.warning("No data in this sheet")
 
 def apply_format_highlighting(df: pd.DataFrame, format_flags: List[Dict]) -> pd.DataFrame:
-    """Apply visual highlighting to format mismatches in the dataframe"""
+    """Apply visual highlighting to format mismatches in the dataframe using a simple but reliable approach"""
     try:
         # Create a copy to avoid modifying original data
         display_df = df.copy()
@@ -1341,36 +1200,94 @@ def apply_format_highlighting(df: pd.DataFrame, format_flags: List[Dict]) -> pd.
                     'pattern': validator.PATTERNS[flag['format_detected']]['pattern']
                 }
         
+        # Simple highlighting using styler.applymap
+        def highlight_mismatched_cell(val):
+            """Highlight individual cells that don't match their column's format"""
+            return 'background-color: #ffcdd2; color: #b71c1c; font-weight: bold; border: 1px solid #f44336;'
+        
+        def check_and_style_cell(val, col_name):
+            """Check if a cell value matches the expected format and style accordingly"""
+            if col_name not in format_info:
+                return ''
+            
+            if pd.isna(val):
+                return ''
+            
+            try:
+                import re
+                pattern = format_info[col_name]['pattern']
+                val_str = str(val).strip()
+                
+                if not re.match(pattern, val_str, re.IGNORECASE):
+                    return 'background-color: #ffcdd2; color: #b71c1c; font-weight: bold; border: 1px solid #f44336;'
+                else:
+                    return ''
+            except:
+                return ''
+        
         # Update column names to show format information
         column_rename = {}
         for col in display_df.columns:
             if col in format_info:
-                format_name = format_info[col]['format_name'].replace('_', ' ').upper()
+                format_name = format_info[col]['format_name'].replace('_', ' ')
                 mismatch_count = format_info[col]['mismatch_count']
-                # Keep column name clean and add format info separately
-                # Don't include the actual data value in the display
-                clean_col = col.split()[0] if ' ' in col else col  # Get first word if there are spaces
-                
-                # Special handling for certain column types
-                if 'GST' in format_name:
-                    column_rename[col] = f"{col} [🚨 {mismatch_count} format errors]"
-                else:
-                    column_rename[col] = f"{col} [🚨 {format_name}: {mismatch_count} errors]"
+                column_rename[col] = f"{col} 🚨 {format_name} ({mismatch_count} errors)"
         
         # Rename columns if there are format issues
         if column_rename:
             display_df = display_df.rename(columns=column_rename)
         
-        return display_df
+        # Apply highlighting using a simple approach
+        def apply_highlighting_to_dataframe(df_to_style):
+            """Apply highlighting across the entire dataframe"""
+            # Create a style matrix
+            style_matrix = pd.DataFrame('', index=df_to_style.index, columns=df_to_style.columns)
+            
+            for col_idx, col in enumerate(display_df.columns):
+                original_col = df.columns[col_idx]  # Get original column name
+                if original_col in format_info:
+                    for row_idx in range(len(df_to_style)):
+                        cell_val = df_to_style.iloc[row_idx, col_idx]
+                        style = check_and_style_cell(cell_val, original_col)
+                        style_matrix.iloc[row_idx, col_idx] = style
+            
+            return style_matrix
+        
+        # Apply the styling
+        styled_df = display_df.style.apply(apply_highlighting_to_dataframe, axis=None)
+        styled_df = styled_df.set_table_attributes(
+            'style="font-size: 12px; border-collapse: collapse; width: 100%;"'
+        )
+        
+        return styled_df
         
     except Exception as e:
         logger.error(f"Error in apply_format_highlighting: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        
+        # Fallback: Just rename columns to show format info
+        try:
+            column_rename = {}
+            for flag in format_flags:
+                col_name = flag['column']
+                if col_name in df.columns:
+                    format_name = flag['format_detected'].replace('_', ' ')
+                    mismatch_count = flag['mismatched_count']
+                    column_rename[col_name] = f"{col_name} 🚨 {format_name} ({mismatch_count} errors)"
+            
+            if column_rename:
+                return df.rename(columns=column_rename)
+            
+        except Exception as e2:
+            logger.error(f"Even fallback failed: {e2}")
+        
         return df
 
 def agent_decide_cleaning(excel_content: bytes, sheet_name: str) -> Dict[str, Any]:
     """Agentic AI to decide if cleaning or table splitting is needed."""
     try:
-        if not get_ai_service().is_available():
+        client = get_anthropic_client()
+        if not client:
             return {"decision": "unknown", "reason": "AI service not available", "issues": []}
 
         temp_file = Path(tempfile.mktemp(suffix=".xlsx"))
@@ -1438,14 +1355,15 @@ def agent_decide_cleaning(excel_content: bytes, sheet_name: str) -> Dict[str, An
         
         Analyze if data cleaning (NOT removal) is needed."""
 
-        # Combine prompts for compatibility
-        combined_prompt = f"{system_prompt}\n\n{user_prompt}"
-        response_text = make_ai_call(combined_prompt, max_tokens=500)
-        
-        if not response_text:
-            return {"decision": "unknown", "reason": "AI service call failed", "issues": []}
+        response = client.messages.create(
+            model="claude-3-5-sonnet-20241022",
+            max_tokens=500,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}]
+        )
         
         try:
+            response_text = response.content[0].text.strip()
             # Try to extract JSON if it's embedded in text
             if '{' in response_text and '}' in response_text:
                 json_start = response_text.find('{')
@@ -1471,19 +1389,25 @@ def agent_decide_cleaning(excel_content: bytes, sheet_name: str) -> Dict[str, An
 
 # Main app
 def main():
-    st.markdown("<div class='main-header'>📊 Excel Data Cleaner (Local Version)</div>", unsafe_allow_html=True)
+    st.markdown("<div class='main-header'>📊 Excel Data Cleaner</div>", unsafe_allow_html=True)
     
     # Sidebar with navigation
     with st.sidebar:
-        st.image("https://via.placeholder.com/150", use_container_width=True)
+        st.image("https://via.placeholder.com/150", use_column_width=True)
         st.markdown("### 🔧 Navigation")
         pages = ["Upload", "Clean", "Analyze", "Apply Suggestions", "Apply Query", "Download"]
         selection = st.radio("Go to", pages, index=0)
         st.markdown("### 📊 Status")
-        ai_status = get_ai_service().get_status()
-        st.success(ai_status) if "✅" in ai_status else st.warning(ai_status)
-        st.info("💾 Local Storage Mode")
-        
+        ai_available = get_anthropic_client() is not None
+        s3_available = True
+        if ai_available:
+            st.success("✅ AI Service Available")
+        else:
+            st.warning("⚠️ AI Service Unavailable")
+        if s3_available:
+            st.success("✅ S3 Connected")
+        else:
+            st.error("❌ S3 Not Configured")
         if st.session_state.current_excel_id:
             st.markdown("### 📂 Current File")
             st.info(f"ID: {st.session_state.current_excel_id[:8]}...")
@@ -1491,8 +1415,6 @@ def main():
             st.info(f"Sheet: {st.session_state.current_sheet_name}")
             if st.button("🗑️ Clear Session"):
                 st.session_state.clear()
-                st.session_state.uploaded_files = {}
-                st.session_state.cleaned_files = {}
                 st.rerun()
 
     # Dynamic tab selection
@@ -1508,51 +1430,70 @@ def main():
                     excel_id = str(uuid.uuid4())
                     content = uploaded_file.read()
                     
-                    # Store in session state
-                    st.session_state.uploaded_files[excel_id] = {
-                        'content': content,
-                        'filename': uploaded_file.name,
-                        'upload_time': datetime.now()
-                    }
+                    # Try S3 upload if enabled, but don't fail if it doesn't work
+                    s3_upload_success = False
+                    try:
+                        from config import get_feature_flags
+                        if get_feature_flags().get("enable_s3_storage", False):
+                            bucket_ready = s3_service.create_bucket_if_not_exists()
+                            if bucket_ready:
+                                temp_file = Path(tempfile.mktemp(suffix=".xlsx"))
+                                with open(temp_file, 'wb') as f:
+                                    f.write(content)
+                                with pd.ExcelFile(temp_file, engine='openpyxl') as xl_file:
+                                    sheet_names = xl_file.sheet_names
+                                for sheet_name in sheet_names:
+                                    s3_service.upload_original_file(excel_id, uploaded_file.name, sheet_name, content)
+                                    metadata = {
+                                        "excel_id": excel_id,
+                                        "filename": uploaded_file.name,
+                                        "sheets": sheet_names,
+                                        "sheet_name": sheet_name,
+                                        "upload_timestamp": datetime.utcnow().isoformat()
+                                    }
+                                    s3_service.upload_metadata(excel_id, uploaded_file.name, sheet_name, metadata)
+                                if temp_file.exists():
+                                    temp_file.unlink()
+                                s3_upload_success = True
+                    except Exception as e:
+                        st.warning(f"S3 storage unavailable: {str(e)}. Processing file locally.")
                     
-                    progress_bar.progress(40)
-                    
-                    # Process file to get sheet names
-                    temp_file = Path(tempfile.mktemp(suffix=".xlsx"))
-                    with open(temp_file, 'wb') as f:
-                        f.write(content)
-                    with pd.ExcelFile(temp_file, engine='openpyxl') as xl_file:
-                        sheet_names = xl_file.sheet_names
-                    if temp_file.exists():
-                        temp_file.unlink()
-                    
-                    progress_bar.progress(60)
+                    # Always process the file locally regardless of S3 status
+                    if not s3_upload_success:
+                        temp_file = Path(tempfile.mktemp(suffix=".xlsx"))
+                        with open(temp_file, 'wb') as f:
+                            f.write(content)
+                        with pd.ExcelFile(temp_file, engine='openpyxl') as xl_file:
+                            sheet_names = xl_file.sheet_names
+                        if temp_file.exists():
+                            temp_file.unlink()
                     
                     st.session_state.current_excel_id = excel_id
                     st.session_state.current_excel_name = uploaded_file.name
                     st.session_state.available_sheets = sheet_names
                     st.session_state.current_sheet_name = sheet_names[0] if sheet_names else None
-                    
                     progress_bar.progress(100)
-                    st.success("✅ File processed successfully!")
                     
+                    if s3_upload_success:
+                        st.success("✅ Uploaded to S3!")
+                    else:
+                        st.success("✅ File processed locally!")
                     col1, col2 = st.columns(2)
                     with col1:
                         st.metric("ID", excel_id[:16] + "...")
                         st.metric("Size", f"{len(content):,} bytes")
                     with col2:
                         st.metric("Sheets", len(sheet_names))
-                        st.metric("Storage", "💾 Local")
+                        st.metric("S3", "✅")
                     st.write("**Sheets:**", ", ".join(sheet_names))
-                    
-                    # Display the first sheet initially
+                    # Display only the first sheet initially
                     excel_data = convert_excel_to_json(content, specific_sheet=st.session_state.current_sheet_name)
                     display_excel_data(excel_data, "📤 Original Data")
-                    
                     with st.spinner("Agent assessing..."):
-                        agent_result = agent_decide_cleaning(content, st.session_state.current_sheet_name)
+                        # Download with any sheet name (S3 stores complete file)
+                        original_content = s3_service.download_original_file(excel_id, uploaded_file.name, sheet_names[0] if sheet_names else "Sheet1")
+                        agent_result = agent_decide_cleaning(original_content, st.session_state.current_sheet_name)
                         st.session_state.agent_decision = agent_result
-                    
                     st.markdown("**Data Quality Assessment:**")
                     if agent_result['decision'] == 'yes':
                         st.warning(f"⚠️ Cleaning recommended: {agent_result['reason']}")
@@ -1577,13 +1518,33 @@ def main():
             else:
                 st.info(f"**File:** {st.session_state.current_excel_name}")
                 
-                # Display available sheets
+                # Always refresh sheet list to ensure we have the latest info
+                try:
+                    # Download original file to check actual sheets
+                    test_content = s3_service.download_original_file(
+                        st.session_state.current_excel_id,
+                        st.session_state.current_excel_name,
+                        st.session_state.available_sheets[0] if st.session_state.available_sheets else "Sheet1"
+                    )
+                    if test_content:
+                        temp_file = Path(tempfile.mktemp(suffix=".xlsx"))
+                        with open(temp_file, 'wb') as f:
+                            f.write(test_content)
+                        with pd.ExcelFile(temp_file, engine='openpyxl') as xl_file:
+                            actual_sheets = xl_file.sheet_names
+                        st.session_state.available_sheets = actual_sheets
+                        if temp_file.exists():
+                            temp_file.unlink()
+                except Exception as e:
+                    st.warning(f"Could not refresh sheet list: {str(e)}")
+                
+                # Display actual available sheets
                 st.write(f"**Available sheets:** {', '.join(st.session_state.available_sheets) if st.session_state.available_sheets else 'None'}")
                 
                 if len(st.session_state.available_sheets) > 1:
                     selected_sheet = st.selectbox(
                         "Select sheet to clean:", 
-                        st.session_state.available_sheets,
+                        st.session_state.available_sheets, 
                         index=st.session_state.available_sheets.index(st.session_state.current_sheet_name) 
                         if st.session_state.current_sheet_name in st.session_state.available_sheets else 0
                     )
@@ -1593,15 +1554,15 @@ def main():
                 else:
                     st.error("❌ No sheets found in the Excel file")
                     selected_sheet = None
-                
                 if 'agent_decision' in st.session_state and st.session_state.agent_decision:
                     decision = st.session_state.agent_decision.get('decision', 'unknown').upper()
                     reason = st.session_state.agent_decision.get('reason', 'No reason provided')
                     st.info(f"Agent: {decision} - {reason}")
-                
                 if st.button("🤖 Re-Assess with Agent"):
                     with st.spinner("Assessing..."):
-                        original_content = st.session_state.uploaded_files[st.session_state.current_excel_id]['content']
+                        # Download with first sheet name (S3 stores complete file)
+                        first_sheet = st.session_state.available_sheets[0] if st.session_state.available_sheets else "Sheet1"
+                        original_content = s3_service.download_original_file(st.session_state.current_excel_id, st.session_state.current_excel_name, first_sheet)
                         agent_result = agent_decide_cleaning(original_content, selected_sheet)
                         st.session_state.agent_decision = agent_result
                         st.markdown("**Data Quality Assessment:**")
@@ -1619,14 +1580,28 @@ def main():
                             st.success(f"✅ Data quality is good: {agent_result['reason']}")
                         else:
                             st.error(f"❌ Assessment error: {agent_result['reason']}")
-                
+                            if 'raw_response' in agent_result:
+                                with st.expander("Debug: Raw AI Response"):
+                                    st.text(agent_result['raw_response'])
+                # Show checkbox for auto-apply but don't auto-execute
+                if st.session_state.agent_decision and st.session_state.agent_decision.get('decision') == 'yes':
+                    auto_apply = st.checkbox("Auto-apply cleaning based on agent recommendation?", value=False)
+                    if auto_apply:
+                        st.info("Click 'Clean Data' button below to apply conservative cleaning")
                 if selected_sheet and st.button("🧹 Clean Data", type="primary"):
                     try:
                         progress_bar = st.progress(0)
                         progress_bar.progress(20)
                         
-                        # Get original content
-                        original_content = st.session_state.uploaded_files[st.session_state.current_excel_id]['content']
+                        # Download the original file - use the first available sheet since S3 stores the complete file
+                        original_content = s3_service.download_original_file(
+                            st.session_state.current_excel_id, 
+                            st.session_state.current_excel_name, 
+                            st.session_state.available_sheets[0] if st.session_state.available_sheets else selected_sheet
+                        )
+                        if not original_content:
+                            st.error("❌ Original file not found in S3")
+                            return
                         
                         temp_input = Path(tempfile.mktemp(suffix=".xlsx"))
                         temp_output = Path(tempfile.mktemp(suffix="_cleaned.xlsx"))
@@ -1635,6 +1610,54 @@ def main():
                             f.write(original_content)
                         
                         progress_bar.progress(40)
+                        
+                        # Verify sheet exists before cleaning
+                        try:
+                            with pd.ExcelFile(temp_input, engine='openpyxl') as xl_file:
+                                actual_sheets = xl_file.sheet_names
+                                logger.info(f"Actual sheets in file: {actual_sheets}")
+                                logger.info(f"Selected sheet for cleaning: {selected_sheet}")
+                                
+                                # Find the matching sheet
+                                matched_sheet = None
+                                
+                                # Try exact match first
+                                if selected_sheet in actual_sheets:
+                                    matched_sheet = selected_sheet
+                                else:
+                                    # Try case-insensitive match
+                                    for sheet in actual_sheets:
+                                        if sheet.lower().strip() == selected_sheet.lower().strip():
+                                            matched_sheet = sheet
+                                            break
+                                
+                                if not matched_sheet:
+                                    # No match found, use first sheet
+                                    if actual_sheets:
+                                        st.warning(f"⚠️ Sheet '{selected_sheet}' not found. Available sheets: {', '.join(actual_sheets)}")
+                                        st.info(f"Using first available sheet: '{actual_sheets[0]}'")
+                                        matched_sheet = actual_sheets[0]
+                                    else:
+                                        st.error("❌ No sheets found in the Excel file")
+                                        if temp_input.exists():
+                                            temp_input.unlink()
+                                        return
+                                elif matched_sheet != selected_sheet:
+                                    st.info(f"Using sheet: '{matched_sheet}'")
+                                
+                                # Update selected_sheet with the actual sheet name
+                                selected_sheet = matched_sheet
+                                
+                                # Update session state with correct sheets
+                                st.session_state.available_sheets = actual_sheets
+                                st.session_state.current_sheet_name = selected_sheet
+                                
+                        except Exception as e:
+                            st.error(f"❌ Error verifying Excel sheets: {str(e)}")
+                            logger.error(f"Sheet verification error: {traceback.format_exc()}")
+                            if temp_input.exists():
+                                temp_input.unlink()
+                            return
                         
                         # Clean the specific sheet
                         logger.info(f"Starting cleaning for sheet: {selected_sheet}")
@@ -1648,6 +1671,7 @@ def main():
                             for change in changes_log:
                                 if "❌" in change:
                                     st.error(change)
+                            # Clean up temp files
                             if temp_input.exists():
                                 temp_input.unlink()
                             if temp_output.exists():
@@ -1666,16 +1690,7 @@ def main():
                         with open(temp_output, 'rb') as f:
                             cleaned_content = f.read()
                         
-                        # Store cleaned content
-                        if st.session_state.current_excel_id not in st.session_state.cleaned_files:
-                            st.session_state.cleaned_files[st.session_state.current_excel_id] = {}
-                        
-                        st.session_state.cleaned_files[st.session_state.current_excel_id][selected_sheet] = {
-                            'content': cleaned_content,
-                            'cleaned_time': datetime.now(),
-                            'dataframe': df
-                        }
-                        
+                        s3_service.upload_cleaned_file(st.session_state.current_excel_id, st.session_state.current_excel_name, selected_sheet, cleaned_content)
                         st.session_state.current_sheet_name = selected_sheet
                         st.session_state.cleaned_data = df
                         
@@ -1684,100 +1699,62 @@ def main():
                             if f.exists():
                                 f.unlink()
                         
-                        progress_bar.progress(90)
-                        
-                        # GIGO Check - Assess data quality
-                        score, quality_details, recommendation, cleanup_suggestions = assess_data_quality(df, header_detected=True)
-                        
                         progress_bar.progress(100)
+                        st.success("✅ Cleaned!")
                         
-                        # Display quality score with color coding
-                        if score < 30:
-                            st.error(f"🗑️ **GARBAGE DATA DETECTED!** Quality Score: {score}/100")
-                            st.error(recommendation)
-                            st.markdown("### ⚠️ Critical Issues Found:")
-                            for issue in quality_details['issues']:
-                                st.write(f"• {issue}")
-                            st.markdown("### 🔧 Required Actions:")
-                            st.warning("This data requires significant manual cleanup before it can be properly processed.")
-                            st.info("Options:\n1. Use AI Chat assistance for guided cleanup\n2. Manually prepare data in Excel\n3. Use specialized data cleaning tools")
-                            for suggestion in cleanup_suggestions:
-                                st.write(f"• {suggestion}")
-                        elif score < 50:
-                            st.warning(f"⚠️ Poor Data Quality: {score}/100")
-                            st.warning(recommendation)
-                        elif score < 70:
-                            st.info(f"📊 Fair Data Quality: {score}/100")
-                            st.info(recommendation)
-                        elif score < 85:
-                            st.success(f"✅ Good Data Quality: {score}/100")
-                            st.success(recommendation)
-                        else:
-                            st.success(f"🌟 Excellent Data Quality: {score}/100")
-                            st.success(recommendation)
-                        
-                        # Show metrics
-                        col1, col2, col3, col4 = st.columns(4)
+                        col1, col2, col3 = st.columns(3)
                         with col1:
-                            st.metric("Quality Score", f"{score}/100")
-                        with col2:
                             st.metric("Rows", df.shape[0])
-                        with col3:
+                        with col2:
                             st.metric("Columns", df.shape[1])
-                        with col4:
+                        with col3:
                             st.metric("Time", f"{processing_time:.2f}s")
                         
                         with st.expander("📋 Changes", expanded=True):
                             for change in changes_log:
                                 st.write(change)
                         
-                        # Show quality breakdown
-                        with st.expander("📊 Data Quality Details", expanded=(score < 50)):
-                            st.markdown("### Quality Score Breakdown:")
-                            
-                            # Create a visual representation of scores
-                            score_cols = st.columns(3)
-                            for idx, (component, comp_score) in enumerate(quality_details['scores'].items()):
-                                col_idx = idx % 3
-                                with score_cols[col_idx]:
-                                    # Color code based on score
-                                    if comp_score < 30:
-                                        color = "🔴"
-                                    elif comp_score < 50:
-                                        color = "🟠"
-                                    elif comp_score < 70:
-                                        color = "🟡"
-                                    elif comp_score < 85:
-                                        color = "🟢"
-                                    else:
-                                        color = "✅"
-                                    
-                                    component_name = component.replace('_', ' ').title()
-                                    st.metric(f"{color} {component_name}", f"{comp_score:.0f}/100")
-                            
-                            st.markdown("### Data Statistics:")
-                            for stat_name, stat_value in quality_details['stats'].items():
-                                stat_display = stat_name.replace('_', ' ').title()
-                                st.write(f"• **{stat_display}:** {stat_value}")
-                            
-                            if quality_details['issues']:
-                                st.markdown("### Issues Detected:")
-                                for issue in quality_details['issues']:
-                                    st.write(f"• {issue}")
-                            
-                            if cleanup_suggestions:
-                                st.markdown("### Recommended Actions:")
-                                for suggestion in cleanup_suggestions:
-                                    st.write(f"• {suggestion}")
-                        
                         # Convert only the specific cleaned sheet to JSON
                         cleaned_excel_data = convert_excel_to_json(cleaned_content, specific_sheet=selected_sheet)
+                        # Run format validation on cleaned data for highlighting
+                        cleaned_temp_file = Path(tempfile.mktemp(suffix=".xlsx"))
+                        with open(cleaned_temp_file, 'wb') as f:
+                            f.write(cleaned_content)
                         
-                        # Run format validation on cleaned data
-                        _, cleaned_format_flags = validate_and_flag_formats(df)
+                        # Check what sheets are actually in the cleaned file
+                        try:
+                            with pd.ExcelFile(cleaned_temp_file, engine='openpyxl') as xl:
+                                cleaned_sheets = xl.sheet_names
+                                logger.info(f"Sheets in cleaned file: {cleaned_sheets}")
+                                
+                                # Find the matching sheet
+                                sheet_to_read = selected_sheet
+                                if selected_sheet not in cleaned_sheets:
+                                    # Try to find a matching sheet
+                                    for sheet in cleaned_sheets:
+                                        if sheet.lower() == selected_sheet.lower():
+                                            sheet_to_read = sheet
+                                            break
+                                    else:
+                                        # Use first sheet if no match
+                                        if cleaned_sheets:
+                                            sheet_to_read = cleaned_sheets[0]
+                                            logger.warning(f"Sheet '{selected_sheet}' not in cleaned file, using '{sheet_to_read}'")
+                                
+                                # Read the sheet for format validation
+                                cleaned_df = pd.read_excel(cleaned_temp_file, sheet_name=sheet_to_read, engine='openpyxl')
+                                _, cleaned_format_flags = validate_and_flag_formats(cleaned_df)
+                        except Exception as e:
+                            logger.error(f"Error reading cleaned file: {e}")
+                            cleaned_format_flags = []
                         
+                        if cleaned_temp_file.exists():
+                            cleaned_temp_file.unlink()
                         display_excel_data(cleaned_excel_data, "🧹 Cleaned Data", cleaned_format_flags)
                         
+                    except FileNotFoundError as e:
+                        st.error(f"❌ File error: {str(e)}")
+                        logger.error(f"FileNotFoundError: {traceback.format_exc()}")
                     except Exception as e:
                         st.error(f"❌ Cleaning failed: {str(e)}")
                         logger.error(f"Cleaning error: {traceback.format_exc()}")
@@ -1787,20 +1764,21 @@ def main():
             st.markdown("<div class='section-header'>🔍 Analyze</div>", unsafe_allow_html=True)
             if not st.session_state.current_excel_id:
                 st.warning("⚠️ Upload and clean a file first!")
-            elif st.session_state.current_excel_id not in st.session_state.cleaned_files:
-                st.warning("⚠️ Clean the file first!")
-            elif st.session_state.current_sheet_name not in st.session_state.cleaned_files[st.session_state.current_excel_id]:
-                st.warning("⚠️ Clean this sheet first!")
             else:
                 st.info(f"**File:** {st.session_state.current_excel_name} - **Sheet:** {st.session_state.current_sheet_name}")
                 if st.button("🔍 Analyze with AI", type="primary"):
                     with st.spinner("Analyzing..."):
-                        # Get cleaned dataframe
-                        df = st.session_state.cleaned_files[st.session_state.current_excel_id][st.session_state.current_sheet_name]['dataframe']
+                        cleaned_content = s3_service.download_cleaned_file(st.session_state.current_excel_id, st.session_state.current_excel_name, st.session_state.current_sheet_name)
+                        temp_file = Path(tempfile.mktemp(suffix=".xlsx"))
+                        with open(temp_file, 'wb') as f:
+                            f.write(cleaned_content)
+                        df = pd.read_excel(temp_file, engine='openpyxl')
                         
                         # Run format validation
                         _, format_flags = validate_and_flag_formats(df)
                         
+                        if temp_file.exists():
+                            temp_file.unlink()
                         analysis, errors = ai_analyze_df(df)
                         if analysis:
                             st.session_state.analysis_results = analysis
@@ -1835,6 +1813,7 @@ def main():
                             # Display metadata in an expandable section
                             if 'metadata' in analysis:
                                 with st.expander("📊 Detailed Column Metadata", expanded=False):
+                                    # Create a more readable metadata display
                                     for col_name, col_meta in analysis['metadata'].items():
                                         st.markdown(f"**Column: `{col_name}`**")
                                         col1, col2, col3 = st.columns(3)
@@ -1845,17 +1824,21 @@ def main():
                                             st.write(f"Unique: {col_meta.get('unique_count', 0)}")
                                             st.write(f"Missing: {col_meta.get('null_percentage', 0)}%")
                                         with col3:
-                                            if col_meta.get('has_whitespace_issues'):
-                                                st.write("⚠️ Whitespace issues")
+                                            if col_meta.get('has_leading_spaces'):
+                                                st.write("⚠️ Leading spaces")
+                                            if col_meta.get('has_trailing_spaces'):
+                                                st.write("⚠️ Trailing spaces")
                                             if col_meta.get('has_mixed_types'):
                                                 st.write("⚠️ Mixed types")
                                         
+                                        # Show sample values
                                         if col_meta.get('sample_values'):
                                             st.write(f"Sample values: {', '.join(str(v) for v in col_meta['sample_values'][:5])}")
                                         
+                                        # Show numeric statistics if available
                                         if 'min' in col_meta:
                                             st.write(f"Range: [{col_meta.get('min')}, {col_meta.get('max')}]")
-                                            st.write(f"Mean: {col_meta.get('mean')}")
+                                            st.write(f"Mean: {col_meta.get('mean')}, Std: {col_meta.get('std')}")
                                         
                                         st.markdown("---")
                             
@@ -1885,29 +1868,22 @@ def main():
                     selected_suggestions = [s for i, s in enumerate(st.session_state.analysis_results['suggestions']) if st.checkbox(s, key=f"sug_{i}")]
                     if selected_suggestions and st.button("💡 Apply", type="primary"):
                         with st.spinner("Applying..."):
-                            # Get cleaned dataframe
-                            df = st.session_state.cleaned_files[st.session_state.current_excel_id][st.session_state.current_sheet_name]['dataframe']
+                            cleaned_content = s3_service.download_cleaned_file(st.session_state.current_excel_id, st.session_state.current_excel_name, st.session_state.current_sheet_name)
+                            temp_file = Path(tempfile.mktemp(suffix=".xlsx"))
+                            with open(temp_file, 'wb') as f:
+                                f.write(cleaned_content)
+                            df = pd.read_excel(temp_file, engine='openpyxl')
                             modified_df, result = apply_ai_suggestions(df, selected_suggestions)
-                            
-                            # Save modified dataframe
                             temp_output = Path(tempfile.mktemp(suffix="_suggestions.xlsx"))
                             modified_df.to_excel(temp_output, index=False, engine='openpyxl')
                             with open(temp_output, 'rb') as f:
                                 new_content = f.read()
-                            
-                            # Update stored content
-                            st.session_state.cleaned_files[st.session_state.current_excel_id][st.session_state.current_sheet_name] = {
-                                'content': new_content,
-                                'cleaned_time': datetime.now(),
-                                'dataframe': modified_df
-                            }
-                            
-                            if temp_output.exists():
-                                temp_output.unlink()
-                            
+                            s3_service.upload_cleaned_file(st.session_state.current_excel_id, st.session_state.current_excel_name, st.session_state.current_sheet_name, new_content)
+                            for f in [temp_file, temp_output]:
+                                if f.exists():
+                                    f.unlink()
                             st.success("✅ Applied!")
                             st.write(f"**Result:** {result}")
-                            
                             # Convert only the specific sheet to JSON
                             updated_excel_data = convert_excel_to_json(new_content, specific_sheet=st.session_state.current_sheet_name)
                             display_excel_data(updated_excel_data, "💡 Updated Data")
@@ -1917,38 +1893,27 @@ def main():
             st.markdown("<div class='section-header'>❓ Query</div>", unsafe_allow_html=True)
             if not st.session_state.current_excel_id:
                 st.warning("⚠️ Upload and clean a file first!")
-            elif st.session_state.current_excel_id not in st.session_state.cleaned_files:
-                st.warning("⚠️ Clean the file first!")
-            elif st.session_state.current_sheet_name not in st.session_state.cleaned_files[st.session_state.current_excel_id]:
-                st.warning("⚠️ Clean this sheet first!")
             else:
                 st.info(f"**File:** {st.session_state.current_excel_name} - **Sheet:** {st.session_state.current_sheet_name}")
                 query_text = st.text_area("Enter query:", height=100, placeholder="e.g., Filter sales > 1000")
                 if query_text and st.button("❓ Apply", type="primary"):
                     with st.spinner("Applying..."):
-                        # Get cleaned dataframe
-                        df = st.session_state.cleaned_files[st.session_state.current_excel_id][st.session_state.current_sheet_name]['dataframe']
+                        cleaned_content = s3_service.download_cleaned_file(st.session_state.current_excel_id, st.session_state.current_excel_name, st.session_state.current_sheet_name)
+                        temp_file = Path(tempfile.mktemp(suffix=".xlsx"))
+                        with open(temp_file, 'wb') as f:
+                            f.write(cleaned_content)
+                        df = pd.read_excel(temp_file, engine='openpyxl')
                         modified_df, result = apply_user_query_to_df(df, query_text)
-                        
-                        # Save modified dataframe
                         temp_output = Path(tempfile.mktemp(suffix="_query.xlsx"))
                         modified_df.to_excel(temp_output, index=False, engine='openpyxl')
                         with open(temp_output, 'rb') as f:
                             new_content = f.read()
-                        
-                        # Update stored content
-                        st.session_state.cleaned_files[st.session_state.current_excel_id][st.session_state.current_sheet_name] = {
-                            'content': new_content,
-                            'cleaned_time': datetime.now(),
-                            'dataframe': modified_df
-                        }
-                        
-                        if temp_output.exists():
-                            temp_output.unlink()
-                        
+                        s3_service.upload_cleaned_file(st.session_state.current_excel_id, st.session_state.current_excel_name, st.session_state.current_sheet_name, new_content)
+                        for f in [temp_file, temp_output]:
+                            if f.exists():
+                                f.unlink()
                         st.success("✅ Applied!")
                         st.write(f"**Result:** {result}")
-                        
                         # Convert only the specific sheet to JSON
                         updated_excel_data = convert_excel_to_json(new_content, specific_sheet=st.session_state.current_sheet_name)
                         display_excel_data(updated_excel_data, "❓ Queried Data")
@@ -1963,47 +1928,32 @@ def main():
                 col1, col2 = st.columns(2)
                 with col1:
                     if st.button("📥 Original", type="secondary"):
-                        if st.session_state.current_excel_id in st.session_state.uploaded_files:
-                            content = st.session_state.uploaded_files[st.session_state.current_excel_id]['content']
-                            st.download_button(
-                                "⬇️ Download Original",
-                                content,
-                                f"original_{st.session_state.current_excel_name}",
-                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                            )
+                        content = s3_service.download_original_file(st.session_state.current_excel_id, st.session_state.current_excel_name, st.session_state.current_sheet_name)
+                        if content:
+                            st.download_button("⬇️ Original", content, f"original_{st.session_state.current_excel_name}", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
                         else:
                             st.error("Original not found")
                 with col2:
                     if st.button("📥 Cleaned", type="primary"):
-                        if (st.session_state.current_excel_id in st.session_state.cleaned_files and 
-                            st.session_state.current_sheet_name in st.session_state.cleaned_files[st.session_state.current_excel_id]):
-                            content = st.session_state.cleaned_files[st.session_state.current_excel_id][st.session_state.current_sheet_name]['content']
-                            st.download_button(
-                                "⬇️ Download Cleaned",
-                                content,
-                                f"cleaned_{st.session_state.current_excel_name}",
-                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                            )
+                        content = s3_service.download_cleaned_file(st.session_state.current_excel_id, st.session_state.current_excel_name, st.session_state.current_sheet_name)
+                        if content:
+                            st.download_button("⬇️ Cleaned", content, f"cleaned_{st.session_state.current_excel_name}", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
                         else:
                             st.error("Cleaned not found - clean first")
-                
                 st.markdown("---")
-                st.warning("⚠️ This will clear the current session")
-                if st.button("🗑️ Clear All Data", type="secondary"):
-                    confirm = st.checkbox("Confirm clearing all data")
+                st.warning("⚠️ Deletes all files for this ID!")
+                if st.button("🗑️ Delete from S3", type="secondary"):
+                    confirm = st.checkbox("Confirm deletion")
                     if confirm:
-                        st.session_state.clear()
-                        st.session_state.uploaded_files = {}
-                        st.session_state.cleaned_files = {}
-                        st.success("✅ All data cleared!")
-                        st.rerun()
+                        success = s3_service.delete_files(st.session_state.current_excel_id, st.session_state.current_excel_name, st.session_state.current_sheet_name)
+                        if success:
+                            st.success("✅ Deleted!")
+                            st.session_state.clear()
+                            st.rerun()
+                        else:
+                            st.error("Failed to delete")
 
-    st.markdown("<div style='text-align: center; color: #7f8c8d; font-size: 0.9rem; margin-top: 2rem;'>Excel Data Cleaner v2.0 (Local)</div>", unsafe_allow_html=True)
+    st.markdown("<div style='text-align: center; color: #7f8c8d; font-size: 0.9rem; margin-top: 2rem;'>Excel Data Cleaner v2.0</div>", unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
-
-#      in streamlit_demo_local.py , I want to add one more functionility that is garbage in garbage out , if      │
-# │   data quality score is below 30 then assign it as garbage out means you have to clean it with our AI chat   │
-# │   bot or using manual cleanup method , but how you will determine data quality score it depens on several    │
-# │   factors missing value , 

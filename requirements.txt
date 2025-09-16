@@ -1,14 +1,15 @@
-fastapi
-uvicorn[standard]
-python-multipart
-pandas
-openpyxl
-numpy
-anthropic
-python-dotenv
-streamlit
-pydantic
-aiofiles
-boto3
-botocore
-openai
+# Requirements for Excel Data Cleaner - Local Version
+streamlit>=1.28.0
+pandas>=2.0.0
+numpy>=1.24.0
+openpyxl>=3.1.0
+anthropic>=0.7.0
+python-dotenv>=1.0.0
+regex>=2023.0.0
+
+# Optional (for fallback AI service)
+openai>=1.0.0
+
+# Optional (for AWS S3 storage)
+boto3>=1.28.0
+botocore>=1.31.0
